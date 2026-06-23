@@ -1,0 +1,9 @@
+{
+  "callers": 4,
+  "seed": 7,
+  "max_duration_ms": 5000,
+  "stall_threshold_ms": 60,
+  "profile": { "added_latency_ms": 30, "jitter_ms": 8, "reorder_prob": 0.05, "loss_prob": 0.02, "bandwidth_bps": 64000 },
+  "agent": { "frames_per_turn": 25, "frame_ms": 20, "payload_len": 160, "stop_latency_ms": 40, "endpoint_ms": 20 },
+  "script": { "turns": [ { "at_ms": 0, "dur_ms": 60, "payload_len": 160, "barge_in": { "into_ms": 120, "dur_ms": 80, "payload_len": 160 } } ] }
+}

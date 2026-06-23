@@ -1,0 +1,23 @@
+# golangci-lint configuration for voicechaos.
+# Keeps the default linters plus a few high-signal ones; the project is
+# stdlib-only and idiomatic, so the standard set applies cleanly.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gofmt
+    - revive
+
+issues:
+  exclude-rules:
+    # Test helpers intentionally ignore some errors for brevity.
+    - path: _test\.go
+      linters:
+        - errcheck
