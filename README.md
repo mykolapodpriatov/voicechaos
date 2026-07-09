@@ -92,6 +92,7 @@ internal/
   eventlog/                byte-stable event log + canonical merge
   metrics/                 time-to-stop, double-talk, stall, dropped frames; nearest-rank percentiles
   script/                  Scenario + Script (JSON) + validation
+  config/                  loads + validates Scenario JSON (DisallowUnknownFields); CLI↔runner boundary
   baseline/                save/load + budgeted pass/fail
   tts/                     TTS/STT interfaces + deterministic fakes (real adapters behind //go:build realtts)
   runner/                  bounded pool, cancel-before-wait, ownership-based leak counter
