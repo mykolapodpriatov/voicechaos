@@ -1,6 +1,7 @@
 package eventlog
 
 import (
+	"reflect"
 	"testing"
 
 	"voicechaos/internal/audio"
@@ -48,12 +49,33 @@ func TestMergeOrdersBySessionThenTime(t *testing.T) {
 }
 
 // TestMergeDeterministic: merging the same logs twice yields identical output.
+//
+// The two events are deliberately identical in every canonical sort key EXCEPT
+// SessionIndex (same TS, same type, same Seq), so they form the one tie that
+// only the session-index tie-break can resolve. That makes this the input most
+// able to expose a non-total ordering, so the assertions compare the merged
+// events in full — comparing only lengths would pass for any ordering.
 func TestMergeDeterministic(t *testing.T) {
 	logs := []Log{
 		{SessionIndex: 0, Events: []Event{{Type: EventRecv, TS: 5, Frame: audio.Frame{Seq: 1}}}},
 		{SessionIndex: 1, Events: []Event{{Type: EventRecv, TS: 5, Frame: audio.Frame{Seq: 1}}}},
 	}
-	if len(Merge(logs)) != len(Merge(logs)) {
-		t.Fatal("merge length not stable")
+	first, second := Merge(logs), Merge(logs)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("merge not stable across calls:\nfirst  = %+v\nsecond = %+v", first, second)
+	}
+	// Merge must also leave its input untouched, or a second merge of the same
+	// logs would be merging different data.
+	if !reflect.DeepEqual(logs[0].Events[0], logs[1].Events[0]) {
+		t.Fatalf("Merge mutated its input logs: %+v", logs)
+	}
+	// The tie resolves by session index, ascending — the ordering the equal
+	// TS/type/Seq input above exists to pin down.
+	want := []MergedEvent{
+		{SessionIndex: 0, Event: Event{Type: EventRecv, TS: 5, Frame: audio.Frame{Seq: 1}}},
+		{SessionIndex: 1, Event: Event{Type: EventRecv, TS: 5, Frame: audio.Frame{Seq: 1}}},
+	}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("tie not broken by session index:\ngot  = %+v\nwant = %+v", first, want)
 	}
 }
