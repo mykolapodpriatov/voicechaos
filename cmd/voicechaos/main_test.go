@@ -83,6 +83,37 @@ func TestCheckFailsOnStrictBaseline(t *testing.T) {
 	}
 }
 
+// TestValidateValidScenario: `validate` on a well-formed scenario returns exit 0.
+func TestValidateValidScenario(t *testing.T) {
+	null := devNull(t)
+	scenario := writeScenario(t)
+	if code := run([]string{"validate", scenario}, null, null); code != 0 {
+		t.Fatalf("validate valid exit %d, want 0", code)
+	}
+}
+
+// TestValidateInvalidScenario: `validate` on an invalid scenario (zero callers)
+// returns exit 1.
+func TestValidateInvalidScenario(t *testing.T) {
+	null := devNull(t)
+	p := filepath.Join(t.TempDir(), "bad.json")
+	bad := `{"callers":0,"seed":1,"profile":{},"agent":{"frames_per_turn":1},"script":{"turns":[{"at_ms":0}]}}`
+	if err := os.WriteFile(p, []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"validate", p}, null, null); code != 1 {
+		t.Fatalf("validate invalid exit %d, want 1", code)
+	}
+}
+
+// TestValidateMissingPath: `validate` with no scenario path returns exit 2.
+func TestValidateMissingPath(t *testing.T) {
+	null := devNull(t)
+	if code := run([]string{"validate"}, null, null); code != 2 {
+		t.Fatalf("validate missing-path exit %d, want 2", code)
+	}
+}
+
 // TestUnknownSubcommand returns exit 2.
 func TestUnknownSubcommand(t *testing.T) {
 	null := devNull(t)
