@@ -132,6 +132,9 @@ func validateProfile(p impair.Profile) error {
 	if p.AddedLatencyMs < 0 || p.JitterMs < 0 || p.BandwidthBps < 0 {
 		return errors.New("scenario: profile latency/jitter/bandwidth must be >= 0")
 	}
+	if p.ReorderDelayMs < 0 {
+		return errors.New("scenario: profile.reorder_delay_ms must be >= 0")
+	}
 	return nil
 }
 

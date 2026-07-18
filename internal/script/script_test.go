@@ -25,13 +25,14 @@ func TestValidateAcceptsValid(t *testing.T) {
 
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]func(*Scenario){
-		"zero callers":     func(s *Scenario) { s.Callers = 0 },
-		"no turns":         func(s *Scenario) { s.Script.Turns = nil },
-		"zero frames":      func(s *Scenario) { s.Agent.FramesPerTurn = 0 },
-		"loss > 1":         func(s *Scenario) { s.Profile.LossProb = 1.5 },
-		"reorder negative": func(s *Scenario) { s.Profile.ReorderProb = -0.1 },
-		"latency negative": func(s *Scenario) { s.Profile.AddedLatencyMs = -1 },
-		"negative into":    func(s *Scenario) { s.Script.Turns[0].BargeIn.IntoMs = -5 },
+		"zero callers":           func(s *Scenario) { s.Callers = 0 },
+		"no turns":               func(s *Scenario) { s.Script.Turns = nil },
+		"zero frames":            func(s *Scenario) { s.Agent.FramesPerTurn = 0 },
+		"loss > 1":               func(s *Scenario) { s.Profile.LossProb = 1.5 },
+		"reorder negative":       func(s *Scenario) { s.Profile.ReorderProb = -0.1 },
+		"latency negative":       func(s *Scenario) { s.Profile.AddedLatencyMs = -1 },
+		"negative into":          func(s *Scenario) { s.Script.Turns[0].BargeIn.IntoMs = -5 },
+		"reorder delay negative": func(s *Scenario) { s.Profile.ReorderDelayMs = -100 },
 	}
 	for name, mutate := range cases {
 		s := validScenario()
@@ -39,6 +40,21 @@ func TestValidateRejects(t *testing.T) {
 		if err := s.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", name)
 		}
+	}
+}
+
+// TestValidateNegativeReorderDelayMessage: a negative reorder_delay_ms is
+// rejected with a descriptive message, defending scenario files against the
+// same past-delivery bug the queue floor guards against.
+func TestValidateNegativeReorderDelayMessage(t *testing.T) {
+	s := validScenario()
+	s.Profile.ReorderDelayMs = -100
+	err := s.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for negative reorder_delay_ms")
+	}
+	if got, want := err.Error(), "scenario: profile.reorder_delay_ms must be >= 0"; got != want {
+		t.Fatalf("error %q, want %q", got, want)
 	}
 }
 

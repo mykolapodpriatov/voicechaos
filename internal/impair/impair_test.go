@@ -291,3 +291,26 @@ func TestReorderAddsDelay(t *testing.T) {
 		}
 	}
 }
+
+// TestNegativeReorderDelayFlooredToSendNow: a Profile constructed directly in Go
+// (bypassing scenario validation) with a negative ReorderDelayMs must never
+// produce a deliverAt behind sendNow — the reorder step re-asserts the
+// no-past-delivery floor so the scheduler's monotonic-clock invariant holds.
+func TestNegativeReorderDelayFlooredToSendNow(t *testing.T) {
+	p := Profile{ReorderProb: 1.0, ReorderDelayMs: -100}
+	q := NewQueue(p, 1, 0)
+	for i := 0; i < 100; i++ {
+		now := int64(i * 20)
+		da, drop := q.Delay(frame(int64(i), now, 0), now)
+		if drop {
+			t.Fatalf("frame %d unexpectedly dropped", i)
+		}
+		if da < now {
+			t.Fatalf("frame %d deliverAt %d rewound behind sendNow %d", i, da, now)
+		}
+		// With no latency/jitter the floored value is exactly sendNow.
+		if da != now {
+			t.Fatalf("frame %d deliverAt %d, want %d (floored)", i, da, now)
+		}
+	}
+}

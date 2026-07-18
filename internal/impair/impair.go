@@ -118,6 +118,15 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 		}
 		deliverAt += int64(extra)
 	}
+	// Re-assert the no-past-delivery floor AFTER reorder. A negative
+	// ReorderDelayMs (rejected by validateProfile, but the Queue is constructible
+	// directly in Go) would otherwise push deliverAt behind sendNow and feed the
+	// shared min-heap scheduler a timestamp behind virtual time, breaking the
+	// monotonic-clock invariant. For non-negative reorder delays this is a no-op,
+	// so the byte-stable event log is unchanged.
+	if deliverAt < sendNow {
+		deliverAt = sendNow
+	}
 
 	// (4) Bandwidth backlog: serialization delay accumulates under saturation.
 	// delay_ms = PayloadLen*8*1000 / BandwidthBps; the frame can only start
