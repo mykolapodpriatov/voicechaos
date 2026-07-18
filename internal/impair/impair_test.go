@@ -1,6 +1,7 @@
 package impair
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 
@@ -238,6 +239,85 @@ func TestCompositionOrderLossBeforeBandwidth(t *testing.T) {
 	}
 }
 
+// TestBurstLossDisabledConsumesRNGLikeIID: with both burst transition probs zero
+// the loss step must draw exactly one Float64 per frame — the plain i.i.d. model,
+// unchanged. Reconstructing the drop pattern with an independent RNG seeded
+// identically pins the byte-stable RNG consumption so committed baselines hold.
+func TestBurstLossDisabledConsumesRNGLikeIID(t *testing.T) {
+	const seed, sessionIndex = 999, 0
+	p := Profile{LossProb: 0.3} // no burst knobs => disabled
+	q := NewQueue(p, seed, sessionIndex)
+	ref := rand.New(rand.NewSource(seed + int64(sessionIndex)))
+	for i := 0; i < 5000; i++ {
+		now := int64(i)
+		_, drop := q.Delay(frame(int64(i), now, 0), now) // payload 0 => loss is the only draw
+		if want := ref.Float64() < p.LossProb; drop != want {
+			t.Fatalf("frame %d drop=%v, want %v (RNG consumption diverged from i.i.d.)", i, drop, want)
+		}
+	}
+}
+
+// TestBurstLossSameSeedSameTrace: the Gilbert-Elliott model replays byte-stably —
+// identical (seed, profile, inputs) yields an identical drop/deliver trace — and
+// actually drops frames.
+func TestBurstLossSameSeedSameTrace(t *testing.T) {
+	p := Profile{AddedLatencyMs: 20, JitterMs: 5, LossProb: 0.05, BurstLossToBadProb: 0.1, BurstLossToGoodProb: 0.4, BandwidthBps: 64000}
+	a := runQueue(NewQueue(p, 77, 2), 500, 1000, 20, 160)
+	b := runQueue(NewQueue(p, 77, 2), 500, 1000, 20, 160)
+	drops := 0
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("burst-loss trace diverged at %d: a=%d b=%d", i, a[i], b[i])
+		}
+		if a[i] < 0 {
+			drops++
+		}
+	}
+	if drops == 0 {
+		t.Fatal("expected some burst-loss drops with the correlated model")
+	}
+}
+
+// TestBurstLossProducesBurst (burst shape): entering the bad state and never
+// recovering yields a maximal run of consecutive drops that i.i.d. loss at
+// LossProb=0 could never produce.
+func TestBurstLossProducesBurst(t *testing.T) {
+	p := Profile{LossProb: 0, BurstLossToBadProb: 1.0, BurstLossToGoodProb: 0.0}
+	q := NewQueue(p, 1, 0)
+	const n = 50
+	tr := runQueue(q, n, 0, 20, 0)
+	// Frame 0 is decided in the good state with LossProb 0 => delivered.
+	if tr[0] < 0 {
+		t.Fatal("frame 0 dropped; good-state LossProb=0 should deliver it")
+	}
+	// The transition after frame 0 forces the bad state; frames 1.. are a burst.
+	for i := 1; i < n; i++ {
+		if tr[i] != -1 {
+			t.Fatalf("frame %d delivered; expected a loss burst (bad state)", i)
+		}
+	}
+	if q.DroppedCount() != n-1 {
+		t.Fatalf("dropped %d, want %d (burst)", q.DroppedCount(), n-1)
+	}
+}
+
+// TestBurstLossRecoversToGood (burst shape): toBad=1 and toGood=1 make the chain
+// alternate good<->bad every frame, so drops land on a strict every-other-frame
+// pattern — proving the bad->good recovery transition fires and losses correlate
+// with state rather than being independent.
+func TestBurstLossRecoversToGood(t *testing.T) {
+	p := Profile{LossProb: 0, BurstLossToBadProb: 1.0, BurstLossToGoodProb: 1.0}
+	q := NewQueue(p, 1, 0)
+	const n = 20
+	tr := runQueue(q, n, 0, 20, 0)
+	for i := 0; i < n; i++ {
+		bad := i%2 == 1 // frame 0 good, then alternate
+		if dropped := tr[i] == -1; dropped != bad {
+			t.Fatalf("frame %d dropped=%v, want %v (alternating good/bad)", i, tr[i] == -1, bad)
+		}
+	}
+}
+
 // TestZeroWallClock: the entire impair test path uses no real time. This sentinel
 // asserts a large simulated run completes effectively instantly (the formulas are
 // pure arithmetic; there is no time.Sleep).
@@ -288,6 +368,29 @@ func TestReorderAddsDelay(t *testing.T) {
 		da, _ := q.Delay(frame(int64(i), now, 0), now)
 		if da != now+10+40 {
 			t.Fatalf("frame %d deliverAt %d, want %d", i, da, now+50)
+		}
+	}
+}
+
+// TestNegativeReorderDelayFlooredToSendNow: a Profile constructed directly in Go
+// (bypassing scenario validation) with a negative ReorderDelayMs must never
+// produce a deliverAt behind sendNow — the reorder step re-asserts the
+// no-past-delivery floor so the scheduler's monotonic-clock invariant holds.
+func TestNegativeReorderDelayFlooredToSendNow(t *testing.T) {
+	p := Profile{ReorderProb: 1.0, ReorderDelayMs: -100}
+	q := NewQueue(p, 1, 0)
+	for i := 0; i < 100; i++ {
+		now := int64(i * 20)
+		da, drop := q.Delay(frame(int64(i), now, 0), now)
+		if drop {
+			t.Fatalf("frame %d unexpectedly dropped", i)
+		}
+		if da < now {
+			t.Fatalf("frame %d deliverAt %d rewound behind sendNow %d", i, da, now)
+		}
+		// With no latency/jitter the floored value is exactly sendNow.
+		if da != now {
+			t.Fatalf("frame %d deliverAt %d, want %d (floored)", i, da, now)
 		}
 	}
 }

@@ -51,6 +51,25 @@ type Profile struct {
 	// ReorderDelayMs is the extra delay applied when a frame is selected for
 	// reordering. Default DefaultReorderDelayMs when zero.
 	ReorderDelayMs int `json:"reorder_delay_ms"`
+	// BurstLossToBadProb and BurstLossToGoodProb parameterize an optional
+	// Gilbert-Elliott two-state (good/bad) correlated-loss model layered onto the
+	// loss step so drops cluster like a real link instead of being i.i.d.
+	// BurstLossToBadProb is P(good->bad) per frame; BurstLossToGoodProb is
+	// P(bad->good). Both must be in [0,1]. The chain starts in the GOOD state,
+	// which loses frames at the base LossProb; the BAD state is a loss burst
+	// (every frame dropped) until the chain returns to good. When BOTH are zero
+	// the model is disabled and loss falls back to plain i.i.d. Bernoulli(LossProb),
+	// consuming the RNG identically so committed baselines stay byte-identical.
+	BurstLossToBadProb  float64 `json:"burst_loss_to_bad_prob"`
+	BurstLossToGoodProb float64 `json:"burst_loss_to_good_prob"`
+}
+
+// burstLossEnabled reports whether the Gilbert-Elliott correlated-loss model is
+// active (either transition probability is non-zero). When it is not, the queue
+// uses the i.i.d. Bernoulli(LossProb) loss model and draws from the RNG exactly
+// as a build without burst loss would, keeping the event log byte-identical.
+func (p Profile) burstLossEnabled() bool {
+	return p.BurstLossToBadProb > 0 || p.BurstLossToGoodProb > 0
 }
 
 // DefaultReorderDelayMs is the extra delay added to a frame chosen for
@@ -71,6 +90,7 @@ type Queue struct {
 	lastDelivery int64 // virtual ms of the last serialized delivery (bandwidth backlog)
 	dropped      []audio.Frame
 	hasLast      bool
+	burstBad     bool // Gilbert-Elliott state: false=good, true=bad (loss burst)
 }
 
 // NewQueue builds a per-session impairment queue. The RNG is seeded with
@@ -92,9 +112,21 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 
 	p := q.profile
 
-	// (1) Loss: drop with LossProb. The RNG is consulted whenever loss is
-	// enabled so the draw sequence is stable regardless of the outcome.
-	if p.LossProb > 0 && q.rng.Float64() < p.LossProb {
+	// (1) Loss. Two models share this single per-frame loss decision:
+	//
+	//   - Gilbert-Elliott two-state correlated (burst) loss when either burst
+	//     transition probability is set: a good/bad Markov state drives the loss
+	//     rate so drops cluster. It draws from the per-session RNG in a fixed
+	//     sequence (loss decision, then state transition) so replay is byte-stable.
+	//   - i.i.d. Bernoulli(LossProb) otherwise — unchanged: the RNG is consulted
+	//     only when LossProb > 0 (one draw per frame), so a zero-burst profile's
+	//     trace is byte-identical to before this model existed.
+	if p.burstLossEnabled() {
+		if q.burstLossDrop() {
+			q.dropped = append(q.dropped, f)
+			return 0, true
+		}
+	} else if p.LossProb > 0 && q.rng.Float64() < p.LossProb {
 		q.dropped = append(q.dropped, f)
 		return 0, true
 	}
@@ -118,6 +150,15 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 		}
 		deliverAt += int64(extra)
 	}
+	// Re-assert the no-past-delivery floor AFTER reorder. A negative
+	// ReorderDelayMs (rejected by validateProfile, but the Queue is constructible
+	// directly in Go) would otherwise push deliverAt behind sendNow and feed the
+	// shared min-heap scheduler a timestamp behind virtual time, breaking the
+	// monotonic-clock invariant. For non-negative reorder delays this is a no-op,
+	// so the byte-stable event log is unchanged.
+	if deliverAt < sendNow {
+		deliverAt = sendNow
+	}
 
 	// (4) Bandwidth backlog: serialization delay accumulates under saturation.
 	// delay_ms = PayloadLen*8*1000 / BandwidthBps; the frame can only start
@@ -135,6 +176,30 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 	}
 
 	return deliverAt, false
+}
+
+// burstLossDrop advances the Gilbert-Elliott loss state machine by one frame and
+// reports whether this frame is lost. It draws from the per-session RNG in a
+// fixed sequence — first the loss decision for the CURRENT state, then the state
+// transition — so the correlated-loss trace is reproducible on replay. The good
+// state loses frames at the base LossProb; the bad state is a loss burst (every
+// frame dropped) until the chain transitions back to good. The caller holds q.mu.
+func (q *Queue) burstLossDrop() bool {
+	p := q.profile
+	lossProb := p.LossProb
+	if q.burstBad {
+		lossProb = 1.0 // bad state: burst — drop every frame
+	}
+	lost := q.rng.Float64() < lossProb
+	// Transition to the next state (one draw either way, fixed order).
+	if q.burstBad {
+		if q.rng.Float64() < p.BurstLossToGoodProb {
+			q.burstBad = false
+		}
+	} else if q.rng.Float64() < p.BurstLossToBadProb {
+		q.burstBad = true
+	}
+	return lost
 }
 
 // Dropped returns a copy of the frames this queue has dropped so far, in drop

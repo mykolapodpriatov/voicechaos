@@ -18,6 +18,8 @@ type Aggregate struct {
 	StallMs    int64 `json:"stall_ms"`
 	// DroppedFrames is summed across sessions.
 	DroppedFrames int `json:"dropped_frames"`
+	// ReorderedFrames is summed across sessions.
+	ReorderedFrames int `json:"reordered_frames"`
 }
 
 // Summary captures the distribution of an integer-millisecond metric.
@@ -78,6 +80,7 @@ func ComputeAggregate(sessions []SessionMetrics) Aggregate {
 		agg.StallCount += s.StallCount
 		agg.StallMs += s.StallMs
 		agg.DroppedFrames += s.DroppedFrames
+		agg.ReorderedFrames += s.ReorderedFrames
 	}
 	agg.TimeToStop = summarize(allTTS)
 	agg.DoubleTalkMs = summarize(dtPerSession)

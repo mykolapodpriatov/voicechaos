@@ -6,10 +6,11 @@
 //
 // Subcommands:
 //
-//	voicechaos run     scenario.json [--loopback] [--out report.json]
+//	voicechaos run      scenario.json [--loopback] [--out report.json]
 //	voicechaos baseline save scenario.json --out baseline.json
-//	voicechaos check   scenario.json --baseline baseline.json [--budget budget.json]
-//	voicechaos report  report.json
+//	voicechaos check    scenario.json --baseline baseline.json [--budget budget.json]
+//	voicechaos report   report.json
+//	voicechaos validate scenario.json
 //
 // The default build runs the deterministic offline loopback path; a real
 // WebSocket endpoint adapter exists (--endpoint) for live runs.
@@ -53,6 +54,8 @@ func run(args []string, stdout, stderr *os.File) int {
 		return cmdCheck(ctx, args[1:], stdout, stderr)
 	case "report":
 		return cmdReport(args[1:], stdout, stderr)
+	case "validate":
+		return cmdValidate(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		usage(stdout)
 		return 0
@@ -71,6 +74,7 @@ Usage:
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
   voicechaos report   <report.json>
+  voicechaos validate <scenario.json>
 
 Flags:
   --loopback   run the deterministic offline pipeline (default)
@@ -225,6 +229,33 @@ func cmdReport(args []string, stdout, stderr *os.File) int {
 	return 0
 }
 
+// cmdValidate lints a scenario file without executing a run: it loads (which
+// parses + validates) and re-asserts Validate(), printing "OK" on success or the
+// first error, and returns exit 0/1 — a fast fail-fast check for CI and authors.
+func cmdValidate(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if code, ok := parseArgs(fs, args, stderr); !ok {
+		return code
+	}
+	scenarioPath := fs.Arg(0)
+	if scenarioPath == "" {
+		fmt.Fprintln(stderr, "validate: missing scenario path")
+		return 2
+	}
+	sc, err := config.LoadScenario(scenarioPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "validate: %v\n", err)
+		return 1
+	}
+	if err := sc.Validate(); err != nil {
+		fmt.Fprintf(stderr, "validate: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "OK")
+	return 0
+}
+
 // printReport writes a concise human-readable summary of a report.
 func printReport(w *os.File, rep runner.Report) {
 	a := rep.Aggregate
@@ -234,6 +265,7 @@ func printReport(w *os.File, rep runner.Report) {
 	fmt.Fprintf(w, "  double-talk  (ms): sum=%d mean=%d p95=%d\n", a.DoubleTalkMs.Sum, a.DoubleTalkMs.Mean, a.DoubleTalkMs.P95)
 	fmt.Fprintf(w, "  stalls           : count=%d totalMs=%d\n", a.StallCount, a.StallMs)
 	fmt.Fprintf(w, "  dropped frames   : %d\n", a.DroppedFrames)
+	fmt.Fprintf(w, "  reordered frames : %d\n", a.ReorderedFrames)
 }
 
 // parseArgs parses fs, tolerating a positional argument placed AFTER flags
