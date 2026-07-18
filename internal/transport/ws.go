@@ -126,8 +126,16 @@ func DialWS(ctx context.Context, rawURL string, maxMsgBytes int) (*WSConn, error
 // Sec-WebSocket-Accept.
 func (c *WSConn) handshake(ctx context.Context, u *url.URL) error {
 	if dl, ok := ctx.Deadline(); ok {
-		_ = c.conn.SetDeadline(dl)
-		defer c.conn.SetDeadline(time.Time{})
+		// Setting the deadline is what bounds the handshake. If it fails, the
+		// blocking write+read below would run with NO timeout and could hang
+		// forever, so fail fast rather than swallow it.
+		if err := c.conn.SetDeadline(dl); err != nil {
+			return fmt.Errorf("ws: set handshake deadline: %w", err)
+		}
+		// Clearing it can only fail on an already-broken conn, and every later
+		// read/write would then fail with that same error anyway. Nothing useful
+		// to report, and nothing to return it through from a defer.
+		defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
 	}
 
 	keyBytes := make([]byte, 16)
@@ -180,7 +188,9 @@ func AcceptKey(clientKey string) string { return acceptKey(clientKey) }
 
 func acceptKey(clientKey string) string {
 	h := sha1.New()
-	io.WriteString(h, clientKey+wsGUID)
+	// hash.Hash's Write is documented never to return an error, so there is no
+	// failure to handle here and no error path to plumb through acceptKey.
+	_, _ = io.WriteString(h, clientKey+wsGUID)
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
@@ -203,8 +213,14 @@ func (c *WSConn) writeFrame(ctx context.Context, opcode byte, payload []byte) er
 		return ErrClosed
 	}
 	if dl, ok := ctx.Deadline(); ok {
-		_ = c.conn.SetWriteDeadline(dl)
-		defer c.conn.SetWriteDeadline(time.Time{})
+		// The deadline is the only thing bounding the two conn.Write calls below;
+		// without it a stalled peer blocks this write (and the wmu it holds)
+		// indefinitely. A failure to arm it must therefore surface, not vanish.
+		if err := c.conn.SetWriteDeadline(dl); err != nil {
+			return fmt.Errorf("ws: set write deadline: %w", err)
+		}
+		// Clearing only fails on an already-broken conn; see handshake.
+		defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	}
 
 	var header [14]byte
@@ -254,15 +270,22 @@ func (c *WSConn) writeFrame(ctx context.Context, opcode byte, payload []byte) er
 // read by setting a past read deadline so the read goroutine never leaks.
 func (c *WSConn) Read(ctx context.Context) (Message, error) {
 	// Wire ctx cancellation to a past read deadline so a blocked Read returns.
+	// This runs on ctx's goroutine with no error path to return through; if it
+	// fails the conn is already broken and the blocked read is failing anyway.
 	stop := context.AfterFunc(ctx, func() {
 		_ = c.conn.SetReadDeadline(time.Unix(0, 0))
 	})
 	defer stop()
-	// Apply any ctx deadline up front, too.
+	// Apply any ctx deadline up front, too. This is what bounds a read against a
+	// silent peer, so a failure to arm it can leave Read blocked past the
+	// caller's deadline — report it instead of dropping it.
 	if dl, ok := ctx.Deadline(); ok {
-		_ = c.conn.SetReadDeadline(dl)
+		if err := c.conn.SetReadDeadline(dl); err != nil {
+			return Message{}, fmt.Errorf("ws: set read deadline: %w", err)
+		}
 	}
-	defer c.conn.SetReadDeadline(time.Time{})
+	// Clearing only fails on an already-broken conn; see handshake.
+	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 
 	var (
 		buf      []byte
@@ -441,8 +464,15 @@ func (c *WSConn) writeFrameAllowClosed(ctx context.Context, opcode byte, payload
 		return fmt.Errorf("ws: control frame payload %d bytes exceeds RFC6455 limit of 125", pl)
 	}
 	if dl, ok := ctx.Deadline(); ok {
-		_ = c.conn.SetWriteDeadline(dl)
-		defer c.conn.SetWriteDeadline(time.Time{})
+		// Same reasoning as writeFrame: the deadline is all that bounds the
+		// writes below. Callers here (the close handshake) already choose to
+		// ignore the returned error, but that is their decision to make — this
+		// function should still report the failure rather than hide it.
+		if err := c.conn.SetWriteDeadline(dl); err != nil {
+			return fmt.Errorf("ws: set write deadline: %w", err)
+		}
+		// Clearing only fails on an already-broken conn; see handshake.
+		defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	}
 	var header [14]byte
 	header[0] = 0x80 | opcode

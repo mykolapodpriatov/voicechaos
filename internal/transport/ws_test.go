@@ -194,7 +194,7 @@ func TestWSHandshakeAndEcho(t *testing.T) {
 // TestWSBadAcceptRejected: a server returning a wrong Sec-WebSocket-Accept is
 // rejected by the client.
 func TestWSBadAcceptRejected(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hj := w.(http.Hijacker)
 		conn, _, _ := hj.Hijack()
 		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: WRONG\r\n\r\n"))
@@ -520,7 +520,7 @@ func TestWSControlFrameOversizedPayloadRejected(t *testing.T) {
 	// Drain the server side so that, even if the guard were missing and the
 	// malformed frame got written, the write completes and the assertion fires
 	// immediately (rather than blocking on an unread pipe).
-	newConn := func(t *testing.T) (*WSConn, func()) {
+	newConn := func(_ *testing.T) (*WSConn, func()) {
 		srv, cli := net.Pipe()
 		drained := make(chan struct{})
 		go func() { defer close(drained); _, _ = io.Copy(io.Discard, srv) }()

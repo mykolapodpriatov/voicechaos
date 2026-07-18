@@ -179,7 +179,7 @@ func TestEqualDeliverAtSchedulingSeqStrictTotalOrder(t *testing.T) {
 	// A downlink that snaps every deliverAt down to a 100ms bucket forces several
 	// agent frames (sent 20ms apart) to share a deliverAt on the wire; but the
 	// agent's OWN scheduling seqs (recorded here) are what must already be unique.
-	bucket := func(f audio.Frame, sendNow int64) (int64, bool) { return sendNow - (sendNow % 100), false }
+	bucket := func(_ audio.Frame, sendNow int64) (int64, bool) { return sendNow - (sendNow % 100), false }
 	caller, agentEnd := transport.Loopback(mc, 0, nil, bucket)
 	ag := agentproto.NewFakeAgent(cfg, rec, agentEnd, 0)
 
@@ -244,7 +244,7 @@ func TestEqualDeliverAtSchedulingSeqStrictTotalOrder(t *testing.T) {
 // deliverAt scenario twice and compares the full received-frame sequences.
 func TestEqualDeliverAtReplayByteIdentical(t *testing.T) {
 	cfg := agentproto.FakeConfig{FramesPerTurn: 8, FrameMs: 20, PayloadLen: 100, StopLatencyMs: 40, EndpointMs: 20}
-	bucket := func(f audio.Frame, sendNow int64) (int64, bool) { return sendNow - (sendNow % 100), false }
+	bucket := func(_ audio.Frame, sendNow int64) (int64, bool) { return sendNow - (sendNow % 100), false }
 	run := func() []audio.Frame {
 		mc := clock.NewManualClock(1_000_000)
 		caller, agentEnd := transport.Loopback(mc, 0, nil, bucket)

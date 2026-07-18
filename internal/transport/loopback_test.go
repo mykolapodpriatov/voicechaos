@@ -102,7 +102,7 @@ func TestLoopbackDuplexDelivery(t *testing.T) {
 func TestLoopbackOrderingByDeliverAt(t *testing.T) {
 	mc := clock.NewManualClock(0)
 	// Delay later-sent frames less so they overtake: deliverAt = 1000 - seq*100.
-	delay := func(f audio.Frame, now int64) (int64, bool) {
+	delay := func(f audio.Frame, _ int64) (int64, bool) {
 		return 1000 - f.Seq*100, false
 	}
 	caller, agent := Loopback(mc, 0, delay, nil)
