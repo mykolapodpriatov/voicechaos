@@ -146,6 +146,48 @@ func TestDroppedFrames(t *testing.T) {
 	}
 }
 
+// TestReorderedFrames counts received agent frames whose Seq is below the running
+// max already seen. Frames arrive (by receive TS) 0,1,3,2,4,2: seq 2 after 3 and
+// seq 2 after 4 are the two out-of-order arrivals. Non-agent recvs and drops are
+// ignored.
+func TestReorderedFrames(t *testing.T) {
+	lg := buildLog(0,
+		ev{eventlog.EventRecv, 10, 1, agentFrame(0, 20)},
+		ev{eventlog.EventRecv, 20, 1, agentFrame(1, 20)},
+		ev{eventlog.EventRecv, 30, 1, agentFrame(3, 20)},
+		ev{eventlog.EventRecv, 40, 1, agentFrame(2, 20)}, // 2 < max 3 -> reordered
+		ev{eventlog.EventRecv, 50, 1, agentFrame(4, 20)},
+		ev{eventlog.EventRecv, 60, 1, agentFrame(2, 20)},  // 2 < max 4 -> reordered
+		ev{eventlog.EventRecv, 70, 1, speechFrame(5, 20)}, // non-agent: ignored
+		ev{eventlog.EventDrop, 80, 1, agentFrame(6, 20)},  // drop: ignored
+	)
+	if m := ComputeSession(lg, 60); m.ReorderedFrames != 2 {
+		t.Fatalf("reordered %d, want 2", m.ReorderedFrames)
+	}
+}
+
+// TestReorderedFramesInOrderIsZero: a strictly increasing agent sequence has no
+// out-of-order arrivals.
+func TestReorderedFramesInOrderIsZero(t *testing.T) {
+	lg := buildLog(0,
+		ev{eventlog.EventRecv, 10, 1, agentFrame(0, 20)},
+		ev{eventlog.EventRecv, 20, 1, agentFrame(1, 20)},
+		ev{eventlog.EventRecv, 30, 1, agentFrame(2, 20)},
+	)
+	if m := ComputeSession(lg, 60); m.ReorderedFrames != 0 {
+		t.Fatalf("reordered %d, want 0 (in order)", m.ReorderedFrames)
+	}
+}
+
+// TestAggregateSumsReorderedFrames: reordered frames are summed across sessions.
+func TestAggregateSumsReorderedFrames(t *testing.T) {
+	a := SessionMetrics{SessionIndex: 0, ReorderedFrames: 2}
+	b := SessionMetrics{SessionIndex: 1, ReorderedFrames: 3}
+	if agg := ComputeAggregate([]SessionMetrics{a, b}); agg.ReorderedFrames != 5 {
+		t.Fatalf("aggregate reordered %d, want 5", agg.ReorderedFrames)
+	}
+}
+
 // TestStallsDeterministicAcrossTurns: stall totals are computed by iterating
 // turns in sorted order (not map-range order), so a multi-turn log with stalls
 // in several turns yields identical StallCount/StallMs on every computation.

@@ -234,6 +234,7 @@ func printReport(w *os.File, rep runner.Report) {
 	fmt.Fprintf(w, "  double-talk  (ms): sum=%d mean=%d p95=%d\n", a.DoubleTalkMs.Sum, a.DoubleTalkMs.Mean, a.DoubleTalkMs.P95)
 	fmt.Fprintf(w, "  stalls           : count=%d totalMs=%d\n", a.StallCount, a.StallMs)
 	fmt.Fprintf(w, "  dropped frames   : %d\n", a.DroppedFrames)
+	fmt.Fprintf(w, "  reordered frames : %d\n", a.ReorderedFrames)
 }
 
 // parseArgs parses fs, tolerating a positional argument placed AFTER flags

@@ -38,6 +38,9 @@ type SessionMetrics struct {
 	StallMs    int64 `json:"stall_ms"`
 	// DroppedFrames is the number of frames the impair layer dropped.
 	DroppedFrames int `json:"dropped_frames"`
+	// ReorderedFrames is the number of received agent frames that arrived out of
+	// order: a frame whose Seq is below the running maximum Seq already received.
+	ReorderedFrames int `json:"reordered_frames"`
 }
 
 // turnSpan records the receive-side [start,end) bounds of a turn and whether an
@@ -63,6 +66,7 @@ func ComputeSession(log eventlog.Log, stallThresholdMs int) SessionMetrics {
 	m.DoubleTalkMs = doubleTalk(log)
 	m.StallCount, m.StallMs = stalls(log, spans, int64(stallThresholdMs))
 	m.DroppedFrames = droppedFrames(log)
+	m.ReorderedFrames = reorderedFrames(log)
 	return m
 }
 
@@ -220,4 +224,27 @@ func droppedFrames(log eventlog.Log) int {
 		}
 	}
 	return n
+}
+
+// reorderedFrames counts received agent frames that arrive out of order: a frame
+// whose Seq is below the running maximum Seq of agent frames already received.
+// The log is in canonical receive order (ComputeSession sorts it first), so a
+// lower Seq at a later position is precisely a frame the caller observed
+// reordered — a deterministic, receive-side complement to dropped frames.
+func reorderedFrames(log eventlog.Log) int {
+	var runningMax int64
+	seen := false
+	count := 0
+	for _, e := range log.Events {
+		if e.Type != eventlog.EventRecv || e.Frame.Kind != audio.KindAgent {
+			continue
+		}
+		if seen && e.Frame.Seq < runningMax {
+			count++
+			continue
+		}
+		runningMax = e.Frame.Seq
+		seen = true
+	}
+	return count
 }
