@@ -103,39 +103,10 @@ func Run(ctx context.Context, sc *script.Scenario, inst *Instrumentation) (Resul
 	// Launch read pumps: each session owns exactly two goroutines (agent driver
 	// + session read pump), both scoped to ctx and counted for leak detection.
 	var wg sync.WaitGroup
-	track := func(fn func()) {
-		if inst != nil && inst.Sem != nil {
-			inst.Sem <- struct{}{}
-		}
-		wg.Add(1)
-		if inst != nil && inst.Live != nil {
-			n := atomic.AddInt64(inst.Live, 1)
-			if inst.Peak != nil {
-				for {
-					p := atomic.LoadInt64(inst.Peak)
-					if n <= p || atomic.CompareAndSwapInt64(inst.Peak, p, n) {
-						break
-					}
-				}
-			}
-		}
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if inst != nil && inst.Live != nil {
-					atomic.AddInt64(inst.Live, -1)
-				}
-				if inst != nil && inst.Sem != nil {
-					<-inst.Sem
-				}
-			}()
-			fn()
-		}()
-	}
 	for i := range rigs {
 		r := rigs[i]
-		track(func() { _ = r.agent.Run(ctx) })
-		track(func() { _ = r.sess.Serve(ctx) })
+		track(&wg, inst, func() { _ = r.agent.Run(ctx) })
+		track(&wg, inst, func() { _ = r.sess.Serve(ctx) })
 	}
 
 	// On cancellation, close every transport end promptly. This is what breaks
@@ -189,6 +160,41 @@ func Run(ctx context.Context, sc *script.Scenario, inst *Instrumentation) (Resul
 		logs[i] = log
 	}
 	return Result{Logs: logs}, ctx.Err()
+}
+
+// track launches fn as one tracked, ownership-counted goroutine: it acquires
+// inst's concurrency semaphore (if any) before starting, updates the
+// live/peak lifecycle counters around fn, and calls wg.Done on exit. Both the
+// offline path (Run) and the live path (RunLive) use it, so the runner's
+// ownership-based leak/concurrency assertions apply uniformly to either.
+func track(wg *sync.WaitGroup, inst *Instrumentation, fn func()) {
+	if inst != nil && inst.Sem != nil {
+		inst.Sem <- struct{}{}
+	}
+	wg.Add(1)
+	if inst != nil && inst.Live != nil {
+		n := atomic.AddInt64(inst.Live, 1)
+		if inst.Peak != nil {
+			for {
+				p := atomic.LoadInt64(inst.Peak)
+				if n <= p || atomic.CompareAndSwapInt64(inst.Peak, p, n) {
+					break
+				}
+			}
+		}
+	}
+	go func() {
+		defer wg.Done()
+		defer func() {
+			if inst != nil && inst.Live != nil {
+				atomic.AddInt64(inst.Live, -1)
+			}
+			if inst != nil && inst.Sem != nil {
+				<-inst.Sem
+			}
+		}()
+		fn()
+	}()
 }
 
 // drive advances the shared clock until the scheduler is empty or ctx is
