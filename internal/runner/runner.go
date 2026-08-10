@@ -56,6 +56,20 @@ type Runner struct {
 	// MaxConcurrency bounds concurrent session goroutines. Zero means unbounded
 	// (sized to all sessions).
 	MaxConcurrency int
+	// Live, when non-nil, selects the live path (engine.RunLive) against a real
+	// endpoint instead of the default deterministic offline loopback+FakeAgent
+	// path (engine.Run). Nil means offline.
+	Live *LiveConfig
+}
+
+// LiveConfig configures Runner.Run's live path: how to dial each session's
+// connection to the real endpoint and which FrameCodec to speak on it.
+type LiveConfig struct {
+	// Dial opens session i's transport.WSConn to the real endpoint.
+	Dial engine.Dialer
+	// NewCodec returns a fresh transport.FrameCodec for one session; it is
+	// called once per session (see engine.CodecFactory).
+	NewCodec engine.CodecFactory
 }
 
 // Run executes the scenario and returns its Report. It validates the scenario,
@@ -69,18 +83,31 @@ func (rn *Runner) Run(ctx context.Context, sc *script.Scenario) (Report, error) 
 
 	var live, peak int64
 	inst := &engine.Instrumentation{Live: &live, Peak: &peak}
-	// Each session owns two goroutines; the shared-clock engine needs them all
-	// co-resident, so the semaphore must admit 2*Callers tokens.
-	needed := 2 * sc.Callers
-	bound := needed
-	if rn.MaxConcurrency > 0 && rn.MaxConcurrency < bound {
-		// Honor the requested bound only if it still admits all pumps; otherwise
-		// the shared-clock driver would deadlock. Report the conflict clearly.
-		return Report{}, errors.New("runner: MaxConcurrency too small for the shared-clock engine; needs >= 2*callers")
-	}
-	inst.Sem = make(chan struct{}, bound)
 
-	res, runErr := engine.Run(ctx, sc, inst)
+	var res engine.Result
+	var runErr error
+	if rn.Live != nil {
+		// Each live session owns exactly one goroutine (its Serve read pump; there
+		// is no FakeAgent driver on the live path), so the semaphore only needs to
+		// admit Callers tokens.
+		bound := sc.Callers
+		if rn.MaxConcurrency > 0 && rn.MaxConcurrency < bound {
+			return Report{}, errors.New("runner: MaxConcurrency too small for the live engine; needs >= callers")
+		}
+		inst.Sem = make(chan struct{}, bound)
+		res, runErr = engine.RunLive(ctx, sc, rn.Live.Dial, rn.Live.NewCodec, inst)
+	} else {
+		// Each session owns two goroutines; the shared-clock engine needs them all
+		// co-resident, so the semaphore must admit 2*Callers tokens.
+		bound := 2 * sc.Callers
+		if rn.MaxConcurrency > 0 && rn.MaxConcurrency < bound {
+			// Honor the requested bound only if it still admits all pumps; otherwise
+			// the shared-clock driver would deadlock. Report the conflict clearly.
+			return Report{}, errors.New("runner: MaxConcurrency too small for the shared-clock engine; needs >= 2*callers")
+		}
+		inst.Sem = make(chan struct{}, bound)
+		res, runErr = engine.Run(ctx, sc, inst)
+	}
 
 	leaked := atomic.LoadInt64(&live)
 

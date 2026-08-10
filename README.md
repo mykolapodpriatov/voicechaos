@@ -57,7 +57,18 @@ voicechaos report report.json
 # Save a metrics baseline, then fail CI on regression beyond a budget
 voicechaos baseline save scenario.json --out baseline.json
 voicechaos check scenario.json --baseline baseline.json   # exit 1 on regression
+
+# Run the same scenario against a real endpoint instead of the offline loopback
+voicechaos run scenario.json --endpoint wss://api.example.com/realtime --codec openai-realtime --out report.json
 ```
+
+### Live runs (`--endpoint`)
+
+`--endpoint` (with a matching `--codec`, one of `openai-realtime` or `gemini-live`) drives the scenario's script against a real WebSocket endpoint through the stdlib `transport.WSTransport`, instead of the offline loopback + `FakeAgent`. This changes the run's semantics in two ways worth knowing:
+
+- **No impairment queue.** `impair.Queue` exists to make the OFFLINE path's simulated chaos reproducible; a live run is already subject to whatever the real network and endpoint do, so nothing is layered on top. `dropped_frames` is therefore always `0` on a live report, and live metrics are not directly comparable to a baseline recorded from an offline `impair.Profile`.
+- **No `FakeAgent`.** The endpoint drives its own turns; `TurnStart`/`TurnEnd` come from the codec decoding the endpoint's own events (e.g. OpenAI Realtime's `response.created`/`response.done`). A scripted barge-in still fires `into_ms` after the caller *observes* that real `TurnStart`, so the same `Script`/`BargeIn` semantics apply — there is just no synthetic turn-start to anchor on.
+- **Timing is real, not virtual.** Script offsets (`at_ms`, `barge_in.into_ms`) are scheduled on elapsed wall-clock time (`clock.RealClock`) from when each session is primed, not on the offline path's virtual `ManualClock`. `max_duration_ms` bounds a live run's real duration; `0` means the run continues until its context is cancelled (Ctrl-C, or an external timeout), so an unbounded live scenario needs an external bound.
 
 ### Scenario (JSON)
 
@@ -95,8 +106,8 @@ internal/
   config/                  loads + validates Scenario JSON (DisallowUnknownFields); CLI↔runner boundary
   baseline/                save/load + budgeted pass/fail
   tts/                     TTS/STT interfaces + deterministic fakes (real adapters behind //go:build realtts)
-  runner/                  bounded pool, cancel-before-wait, ownership-based leak counter
-  engine/                  assembles + drives the deterministic offline pipeline
+  runner/                  bounded pool, cancel-before-wait, ownership-based leak counter; selects offline vs. live via Runner.Live
+  engine/                  assembles + drives the deterministic offline pipeline (Run) and the real-endpoint live pipeline (RunLive)
 ```
 
 ## Determinism & race-safety
@@ -105,7 +116,7 @@ The whole default pipeline is deterministic and offline (injected clock + seeded
 
 ## Roadmap
 
-- **M1–M3 (done):** deterministic clock + impairment core, loopback + `FakeAgent`, scripted barge-ins, metrics, runner, scenario/baseline/CLI, and the stdlib RFC6455 WebSocket transport with OpenAI-Realtime / Gemini-Live frame-mapping codecs.
+- **M1–M3 (done):** deterministic clock + impairment core, loopback + `FakeAgent`, scripted barge-ins, metrics, runner, scenario/baseline/CLI, the stdlib RFC6455 WebSocket transport with OpenAI-Realtime / Gemini-Live frame-mapping codecs, and the `--endpoint`/`--codec` CLI path that drives a scenario against a real endpoint with those codecs.
 - **M4 (designed):** optional pion WebRTC adapter and real ElevenLabs/Deepgram TTS/STT adapters (build-tag seams already in place), a live dashboard, and a scenario recorder from a real call.
 
 ## License

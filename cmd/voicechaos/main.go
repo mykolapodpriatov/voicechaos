@@ -7,13 +7,15 @@
 // Subcommands:
 //
 //	voicechaos run      scenario.json [--loopback] [--out report.json]
+//	voicechaos run      scenario.json --endpoint wss://... --codec openai-realtime|gemini-live
 //	voicechaos baseline save scenario.json --out baseline.json
 //	voicechaos check    scenario.json --baseline baseline.json [--budget budget.json]
 //	voicechaos report   report.json
 //	voicechaos validate scenario.json
 //
-// The default build runs the deterministic offline loopback path; a real
-// WebSocket endpoint adapter exists (--endpoint) for live runs.
+// The default build runs the deterministic offline loopback path; passing
+// --endpoint (with a matching --codec) drives the same scenario against a
+// real WebSocket endpoint instead.
 package main
 
 import (
@@ -28,7 +30,9 @@ import (
 
 	"voicechaos/internal/baseline"
 	"voicechaos/internal/config"
+	"voicechaos/internal/engine"
 	"voicechaos/internal/runner"
+	"voicechaos/internal/transport"
 )
 
 func main() {
@@ -71,6 +75,7 @@ func usage(w *os.File) {
 
 Usage:
   voicechaos run      <scenario.json> [--loopback] [--out report.json]
+  voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--out report.json]
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
   voicechaos report   <report.json>
@@ -78,7 +83,8 @@ Usage:
 
 Flags:
   --loopback   run the deterministic offline pipeline (default)
-  --endpoint   (reserved) a wss:// endpoint for live runs
+  --endpoint   a ws:// or wss:// endpoint to run against live, instead of the offline loopback
+  --codec      frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)
   --out        output file
   --baseline   baseline JSON for check
   --budget     budget JSON for check (defaults to a built-in budget)
@@ -90,7 +96,8 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	fs.SetOutput(stderr)
 	out := fs.String("out", "", "write the report JSON to this file")
 	_ = fs.Bool("loopback", true, "run the deterministic offline pipeline")
-	endpoint := fs.String("endpoint", "", "reserved: wss:// endpoint for live runs")
+	endpoint := fs.String("endpoint", "", "a ws:// or wss:// endpoint to run against live, instead of the offline loopback")
+	codecName := fs.String("codec", "", "frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)")
 	if code, ok := parseArgs(fs, args, stderr); !ok {
 		return code
 	}
@@ -99,16 +106,29 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 		fmt.Fprintln(stderr, "run: missing scenario path")
 		return 2
 	}
-	if *endpoint != "" {
-		fmt.Fprintln(stderr, "run: --endpoint live runs are not enabled in this build; use --loopback")
-		return 2
-	}
 	sc, err := config.LoadScenario(scenarioPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "run: %v\n", err)
 		return 1
 	}
 	rn := &runner.Runner{}
+	if *endpoint != "" {
+		newCodec, cerr := codecFactory(*codecName)
+		if cerr != nil {
+			fmt.Fprintf(stderr, "run: %v\n", cerr)
+			return 2
+		}
+		ep := *endpoint
+		rn.Live = &runner.LiveConfig{
+			Dial: func(dialCtx context.Context, _ int) (*transport.WSConn, error) {
+				return transport.DialWS(dialCtx, ep, 0)
+			},
+			NewCodec: newCodec,
+		}
+	} else if *codecName != "" {
+		fmt.Fprintln(stderr, "run: --codec requires --endpoint")
+		return 2
+	}
 	rep, err := rn.Run(ctx, sc)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(stderr, "run: %v\n", err)
@@ -119,6 +139,24 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 	return 0
+}
+
+// codecFactory maps a --codec flag value to an engine.CodecFactory that
+// builds a fresh transport.FrameCodec per session (GeminiLiveCodec carries
+// per-connection turn state and must not be shared across sessions). name
+// empty (i.e. --endpoint given without --codec) is an error: a live run has
+// no sensible default codec.
+func codecFactory(name string) (engine.CodecFactory, error) {
+	switch name {
+	case "openai-realtime":
+		return func() transport.FrameCodec { return transport.OpenAIRealtimeCodec{} }, nil
+	case "gemini-live":
+		return func() transport.FrameCodec { return &transport.GeminiLiveCodec{} }, nil
+	case "":
+		return nil, errors.New("--codec is required with --endpoint (openai-realtime | gemini-live)")
+	default:
+		return nil, fmt.Errorf("--codec: unknown codec %q (want openai-realtime | gemini-live)", name)
+	}
 }
 
 func cmdBaseline(ctx context.Context, args []string, stdout, stderr *os.File) int {
