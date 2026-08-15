@@ -153,6 +153,45 @@ func wsURL(ts *httptest.Server) string {
 
 // --- tests -------------------------------------------------------------------
 
+// TestWSHandshakeCustomHeaders: extra headers passed to DialWS land on the
+// upgrade request the fake server sees (the path OpenAI Realtime / Gemini Live
+// auth takes).
+func TestWSHandshakeCustomHeaders(t *testing.T) {
+	saw := make(chan http.Header, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		saw <- r.Header.Clone()
+		s, err := upgrade(w, r)
+		if err != nil {
+			return
+		}
+		_ = s.conn.Close()
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hdr := make(http.Header)
+	hdr.Set("Authorization", "Bearer test-key")
+	hdr.Set("OpenAI-Beta", "realtime=v1")
+	conn, err := DialWS(ctx, wsURL(ts), 0, hdr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	select {
+	case got := <-saw:
+		if got.Get("Authorization") != "Bearer test-key" {
+			t.Fatalf("Authorization = %q, want Bearer test-key", got.Get("Authorization"))
+		}
+		if got.Get("OpenAI-Beta") != "realtime=v1" {
+			t.Fatalf("OpenAI-Beta = %q, want realtime=v1", got.Get("OpenAI-Beta"))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server never observed the handshake")
+	}
+}
+
 // TestWSHandshakeAndEcho: a successful handshake (validated Accept) and a masked
 // client frame echoed back.
 func TestWSHandshakeAndEcho(t *testing.T) {
@@ -173,7 +212,7 @@ func TestWSHandshakeAndEcho(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -203,7 +242,7 @@ func TestWSBadAcceptRejected(t *testing.T) {
 	defer ts.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := DialWS(ctx, wsURL(ts), 0); err == nil {
+	if _, err := DialWS(ctx, wsURL(ts), 0, nil); err == nil {
 		t.Fatal("expected handshake rejection on bad Accept")
 	}
 }
@@ -235,7 +274,7 @@ func TestWSFragmentReassembly(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -284,7 +323,7 @@ func TestWSAutoPong(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -328,7 +367,7 @@ func TestWSCloseHandshake(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -360,7 +399,7 @@ func TestWSServerInitiatedClose(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -385,7 +424,7 @@ func TestWSOversizedMessageRejected(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 1024) // 1 KiB limit
+	conn, err := DialWS(ctx, wsURL(ts), 1024, nil) // 1 KiB limit
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -439,7 +478,7 @@ func TestWSClientFramesAreMasked(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -482,7 +521,7 @@ func TestWSCtxCancelUnblocksReadNoLeak(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dialCancel()
-	conn, err := DialWS(dialCtx, wsURL(ts), 0)
+	conn, err := DialWS(dialCtx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -570,7 +609,7 @@ func TestWSTransportRoundTrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := DialWS(ctx, wsURL(ts), 0)
+	conn, err := DialWS(ctx, wsURL(ts), 0, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

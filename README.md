@@ -60,11 +60,24 @@ voicechaos check scenario.json --baseline baseline.json   # exit 1 on regression
 
 # Run the same scenario against a real endpoint instead of the offline loopback
 voicechaos run scenario.json --endpoint wss://api.example.com/realtime --codec openai-realtime --out report.json
+
+# Authenticate the WebSocket upgrade (OpenAI Realtime). Prefer --header-env so
+# the key is not copied into the shell history; put the full header value in
+# the env var (including the "Bearer " prefix). Shell expansion works too.
+export OPENAI_AUTH="Bearer $OPENAI_API_KEY"
+voicechaos run scenario.json \
+  --endpoint "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview" \
+  --codec openai-realtime \
+  --header "OpenAI-Beta: realtime=v1" \
+  --header-env "Authorization=OPENAI_AUTH"
+# equivalent: --header "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
 ### Live runs (`--endpoint`)
 
-`--endpoint` (with a matching `--codec`, one of `openai-realtime` or `gemini-live`) drives the scenario's script against a real WebSocket endpoint through the stdlib `transport.WSTransport`, instead of the offline loopback + `FakeAgent`. This changes the run's semantics in two ways worth knowing:
+`--endpoint` (with a matching `--codec`, one of `openai-realtime` or `gemini-live`) drives the scenario's script against a real WebSocket endpoint through the stdlib `transport.WSTransport`, instead of the offline loopback + `FakeAgent`. Repeatable `--header "Name: value"` flags (curl `-H` form) and `--header-env NAME=ENVVAR` are written onto the opening handshake so APIs that require `Authorization` / `OpenAI-Beta` can actually accept the upgrade. `--header-env` reads the value from the environment at run time so the key does not have to appear on the command line; `--header "Authorization: Bearer $OPENAI_API_KEY"` also works via shell expansion.
+
+This changes the run's semantics in two ways worth knowing:
 
 - **No impairment queue.** `impair.Queue` exists to make the OFFLINE path's simulated chaos reproducible; a live run is already subject to whatever the real network and endpoint do, so nothing is layered on top. `dropped_frames` is therefore always `0` on a live report, and live metrics are not directly comparable to a baseline recorded from an offline `impair.Profile`.
 - **No `FakeAgent`.** The endpoint drives its own turns; `TurnStart`/`TurnEnd` come from the codec decoding the endpoint's own events (e.g. OpenAI Realtime's `response.created`/`response.done`). A scripted barge-in still fires `into_ms` after the caller *observes* that real `TurnStart`, so the same `Script`/`BargeIn` semantics apply — there is just no synthetic turn-start to anchor on.

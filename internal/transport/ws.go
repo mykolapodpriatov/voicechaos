@@ -66,10 +66,23 @@ type WSConn struct {
 	closed    bool
 }
 
+// handshakeReserved is the set of headers the client always writes on the
+// opening handshake. Extra headers with these names are dropped so a caller
+// cannot break the upgrade (duplicate Host, a bogus Sec-WebSocket-Key, …).
+var handshakeReserved = map[string]bool{
+	"Host":                  true,
+	"Upgrade":               true,
+	"Connection":            true,
+	"Sec-Websocket-Key":     true, // CanonicalHeaderKey("Sec-WebSocket-Key")
+	"Sec-Websocket-Version": true, // CanonicalHeaderKey("Sec-WebSocket-Version")
+}
+
 // DialWS dials rawURL (ws:// or wss://) and performs the RFC6455 opening
 // handshake, returning a ready WSConn. ctx bounds the dial + handshake.
-// maxMsgBytes <= 0 selects DefaultMaxMessageBytes.
-func DialWS(ctx context.Context, rawURL string, maxMsgBytes int) (*WSConn, error) {
+// maxMsgBytes <= 0 selects DefaultMaxMessageBytes. header, if non-nil, is
+// copied onto the handshake request (Authorization, OpenAI-Beta, …); reserved
+// handshake names are ignored.
+func DialWS(ctx context.Context, rawURL string, maxMsgBytes int, header http.Header) (*WSConn, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("ws: parse url: %w", err)
@@ -115,7 +128,7 @@ func DialWS(ctx context.Context, rawURL string, maxMsgBytes int) (*WSConn, error
 		maxMsgBytes = DefaultMaxMessageBytes
 	}
 	c := &WSConn{conn: conn, br: bufio.NewReader(conn), maxMsg: maxMsgBytes}
-	if err := c.handshake(ctx, u); err != nil {
+	if err := c.handshake(ctx, u, header); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -123,8 +136,9 @@ func DialWS(ctx context.Context, rawURL string, maxMsgBytes int) (*WSConn, error
 }
 
 // handshake performs the client opening handshake and validates the server's
-// Sec-WebSocket-Accept.
-func (c *WSConn) handshake(ctx context.Context, u *url.URL) error {
+// Sec-WebSocket-Accept. Extra headers (if any) are written after the required
+// RFC6455 fields.
+func (c *WSConn) handshake(ctx context.Context, u *url.URL, header http.Header) error {
 	if dl, ok := ctx.Deadline(); ok {
 		// Setting the deadline is what bounds the handshake. If it fails, the
 		// blocking write+read below would run with NO timeout and could hang
@@ -155,6 +169,16 @@ func (c *WSConn) handshake(ctx context.Context, u *url.URL) error {
 	req.WriteString("Connection: Upgrade\r\n")
 	fmt.Fprintf(&req, "Sec-WebSocket-Key: %s\r\n", key)
 	req.WriteString("Sec-WebSocket-Version: 13\r\n")
+	if extra := header.Clone(); extra != nil {
+		for name := range extra {
+			if handshakeReserved[http.CanonicalHeaderKey(name)] {
+				extra.Del(name)
+			}
+		}
+		if err := extra.Write(&req); err != nil {
+			return fmt.Errorf("ws: write handshake headers: %w", err)
+		}
+	}
 	req.WriteString("\r\n")
 	if _, err := c.conn.Write([]byte(req.String())); err != nil {
 		return fmt.Errorf("ws: write handshake: %w", err)

@@ -7,7 +7,7 @@
 // Subcommands:
 //
 //	voicechaos run      scenario.json [--loopback] [--out report.json]
-//	voicechaos run      scenario.json --endpoint wss://... --codec openai-realtime|gemini-live
+//	voicechaos run      scenario.json --endpoint wss://... --codec openai-realtime|gemini-live [--header "Name: value"] [--header-env NAME=ENVVAR]
 //	voicechaos baseline save scenario.json --out baseline.json
 //	voicechaos check    scenario.json --baseline baseline.json [--budget budget.json]
 //	voicechaos report   report.json
@@ -24,8 +24,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"voicechaos/internal/baseline"
@@ -75,7 +77,7 @@ func usage(w *os.File) {
 
 Usage:
   voicechaos run      <scenario.json> [--loopback] [--out report.json]
-  voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--out report.json]
+  voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--header "Name: value"] [--header-env NAME=ENVVAR] [--out report.json]
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
   voicechaos report   <report.json>
@@ -85,6 +87,8 @@ Flags:
   --loopback   run the deterministic offline pipeline (default)
   --endpoint   a ws:// or wss:// endpoint to run against live, instead of the offline loopback
   --codec      frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)
+  --header     extra handshake header "Name: value" (repeatable; same form as curl -H)
+  --header-env extra handshake header from the environment "Name=ENVVAR" (repeatable)
   --out        output file
   --baseline   baseline JSON for check
   --budget     budget JSON for check (defaults to a built-in budget)
@@ -98,6 +102,9 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	_ = fs.Bool("loopback", true, "run the deterministic offline pipeline")
 	endpoint := fs.String("endpoint", "", "a ws:// or wss:// endpoint to run against live, instead of the offline loopback")
 	codecName := fs.String("codec", "", "frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)")
+	var headers, headerEnvs stringList
+	fs.Var(&headers, "header", `extra WebSocket handshake header "Name: value" (repeatable)`)
+	fs.Var(&headerEnvs, "header-env", `extra handshake header from the environment "Name=ENVVAR" (repeatable)`)
 	if code, ok := parseArgs(fs, args, stderr); !ok {
 		return code
 	}
@@ -118,15 +125,23 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 			fmt.Fprintf(stderr, "run: %v\n", cerr)
 			return 2
 		}
+		hdr, herr := handshakeHeaders(headers, headerEnvs)
+		if herr != nil {
+			fmt.Fprintf(stderr, "run: %v\n", herr)
+			return 2
+		}
 		ep := *endpoint
 		rn.Live = &runner.LiveConfig{
 			Dial: func(dialCtx context.Context, _ int) (*transport.WSConn, error) {
-				return transport.DialWS(dialCtx, ep, 0)
+				return transport.DialWS(dialCtx, ep, 0, hdr)
 			},
 			NewCodec: newCodec,
 		}
 	} else if *codecName != "" {
 		fmt.Fprintln(stderr, "run: --codec requires --endpoint")
+		return 2
+	} else if len(headers) > 0 || len(headerEnvs) > 0 {
+		fmt.Fprintln(stderr, "run: --header/--header-env require --endpoint")
 		return 2
 	}
 	rep, err := rn.Run(ctx, sc)
@@ -157,6 +172,72 @@ func codecFactory(name string) (engine.CodecFactory, error) {
 	default:
 		return nil, fmt.Errorf("--codec: unknown codec %q (want openai-realtime | gemini-live)", name)
 	}
+}
+
+// stringList is a repeatable flag.Value that appends each Set call.
+type stringList []string
+
+func (s *stringList) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ", ")
+}
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// parseHeaderLine splits a curl-style "Name: value" header. The first colon
+// separates the name from the value; surrounding whitespace is trimmed.
+func parseHeaderLine(s string) (name, value string, err error) {
+	name, value, ok := strings.Cut(s, ":")
+	name = strings.TrimSpace(name)
+	if !ok || name == "" {
+		return "", "", fmt.Errorf("invalid --header %q (want \"Name: value\")", s)
+	}
+	return name, strings.TrimSpace(value), nil
+}
+
+// parseHeaderEnv splits a "Name=ENVVAR" spec.
+func parseHeaderEnv(s string) (name, envvar string, err error) {
+	name, envvar, ok := strings.Cut(s, "=")
+	name = strings.TrimSpace(name)
+	envvar = strings.TrimSpace(envvar)
+	if !ok || name == "" || envvar == "" {
+		return "", "", fmt.Errorf("invalid --header-env %q (want NAME=ENVVAR)", s)
+	}
+	return name, envvar, nil
+}
+
+// handshakeHeaders builds the extra handshake header map from --header and
+// --header-env flags. An unset env var is an error so a missing API key
+// cannot silently become an empty Authorization.
+func handshakeHeaders(headers, headerEnvs []string) (http.Header, error) {
+	h := make(http.Header)
+	for _, raw := range headers {
+		name, value, err := parseHeaderLine(raw)
+		if err != nil {
+			return nil, err
+		}
+		h.Add(name, value)
+	}
+	for _, raw := range headerEnvs {
+		name, envvar, err := parseHeaderEnv(raw)
+		if err != nil {
+			return nil, err
+		}
+		val, ok := os.LookupEnv(envvar)
+		if !ok {
+			return nil, fmt.Errorf("--header-env: environment variable %s is not set", envvar)
+		}
+		h.Add(name, val)
+	}
+	if len(h) == 0 {
+		return nil, nil
+	}
+	return h, nil
 }
 
 func cmdBaseline(ctx context.Context, args []string, stdout, stderr *os.File) int {
