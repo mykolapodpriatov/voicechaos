@@ -189,8 +189,17 @@ func writeServerTextFrame(conn net.Conn, s string) error {
 // until it disconnects. It stands in for a real voice endpoint so the live
 // path can be exercised in-process, with no real network.
 func liveWSServer(t *testing.T, messages ...string) *httptest.Server {
+	return liveWSServerOnRequest(t, nil, messages...)
+}
+
+// liveWSServerOnRequest is liveWSServer with an optional hook that sees the
+// upgrade request (used to assert --header / --header-env reach the handshake).
+func liveWSServerOnRequest(t *testing.T, onReq func(*http.Request), messages ...string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if onReq != nil {
+			onReq(r)
+		}
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
 			return
@@ -267,7 +276,7 @@ func TestLiveEndpointDecodesRealFrames(t *testing.T) {
 
 	rn := &runner.Runner{Live: &runner.LiveConfig{
 		Dial: func(ctx context.Context, _ int) (*transport.WSConn, error) {
-			return transport.DialWS(ctx, url, 0)
+			return transport.DialWS(ctx, url, 0, nil)
 		},
 		NewCodec: func() transport.FrameCodec { return transport.OpenAIRealtimeCodec{} },
 	}}
@@ -360,6 +369,104 @@ func TestRunEndpointFlagWiring(t *testing.T) {
 
 	t.Run("unknown codec is rejected", func(t *testing.T) {
 		code := run([]string{"run", scPath, "--endpoint", "ws://127.0.0.1:1", "--codec", "not-a-codec"}, null, null)
+		if code != 2 {
+			t.Fatalf("exit %d, want 2", code)
+		}
+	})
+}
+
+// TestRunHeaderFlags: --header / --header-env land on the WebSocket upgrade
+// request; malformed specs, an unset env var, and using either flag without
+// --endpoint are rejected with exit 2.
+func TestRunHeaderFlags(t *testing.T) {
+	null := devNull(t)
+	scenario := liveScenario(120)
+	data, err := json.Marshal(scenario)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scPath := filepath.Join(t.TempDir(), "live.json")
+	if err := os.WriteFile(scPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("header is sent on the handshake", func(t *testing.T) {
+		saw := make(chan http.Header, 1)
+		ts := liveWSServerOnRequest(t, func(r *http.Request) { saw <- r.Header.Clone() },
+			`{"type":"response.created"}`, `{"type":"response.done"}`)
+		code := run([]string{
+			"run", scPath,
+			"--endpoint", wsURLOf(ts),
+			"--codec", "openai-realtime",
+			"--header", "Authorization: Bearer test-key",
+			"--header", "OpenAI-Beta: realtime=v1",
+		}, null, null)
+		if code != 0 {
+			t.Fatalf("exit %d, want 0", code)
+		}
+		select {
+		case got := <-saw:
+			if got.Get("Authorization") != "Bearer test-key" {
+				t.Fatalf("Authorization = %q, want Bearer test-key", got.Get("Authorization"))
+			}
+			if got.Get("OpenAI-Beta") != "realtime=v1" {
+				t.Fatalf("OpenAI-Beta = %q, want realtime=v1", got.Get("OpenAI-Beta"))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server never observed the handshake")
+		}
+	})
+
+	t.Run("header-env reads the value from the environment", func(t *testing.T) {
+		t.Setenv("VOICECHAOS_TEST_KEY", "Bearer from-env")
+		saw := make(chan http.Header, 1)
+		ts := liveWSServerOnRequest(t, func(r *http.Request) { saw <- r.Header.Clone() },
+			`{"type":"response.created"}`, `{"type":"response.done"}`)
+		code := run([]string{
+			"run", scPath,
+			"--endpoint", wsURLOf(ts),
+			"--codec", "openai-realtime",
+			"--header-env", "Authorization=VOICECHAOS_TEST_KEY",
+		}, null, null)
+		if code != 0 {
+			t.Fatalf("exit %d, want 0", code)
+		}
+		select {
+		case got := <-saw:
+			if got.Get("Authorization") != "Bearer from-env" {
+				t.Fatalf("Authorization = %q, want Bearer from-env", got.Get("Authorization"))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server never observed the handshake")
+		}
+	})
+
+	t.Run("unset header-env is rejected", func(t *testing.T) {
+		code := run([]string{
+			"run", scPath,
+			"--endpoint", "ws://127.0.0.1:1",
+			"--codec", "openai-realtime",
+			"--header-env", "Authorization=VOICECHAOS_TEST_UNSET",
+		}, null, null)
+		if code != 2 {
+			t.Fatalf("exit %d, want 2", code)
+		}
+	})
+
+	t.Run("malformed header is rejected", func(t *testing.T) {
+		code := run([]string{
+			"run", scPath,
+			"--endpoint", "ws://127.0.0.1:1",
+			"--codec", "openai-realtime",
+			"--header", "NotAHeader",
+		}, null, null)
+		if code != 2 {
+			t.Fatalf("exit %d, want 2", code)
+		}
+	})
+
+	t.Run("header without endpoint is rejected", func(t *testing.T) {
+		code := run([]string{"run", scPath, "--header", "Authorization: Bearer x"}, null, null)
 		if code != 2 {
 			t.Fatalf("exit %d, want 2", code)
 		}
