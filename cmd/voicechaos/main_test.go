@@ -16,6 +16,7 @@ import (
 
 	"voicechaos/internal/audio"
 	"voicechaos/internal/eventlog"
+	"voicechaos/internal/metrics"
 	"voicechaos/internal/runner"
 	"voicechaos/internal/script"
 	"voicechaos/internal/transport"
@@ -126,6 +127,68 @@ func TestValidateMissingPath(t *testing.T) {
 	null := devNull(t)
 	if code := run([]string{"validate"}, null, null); code != 2 {
 		t.Fatalf("validate missing-path exit %d, want 2", code)
+	}
+}
+
+// writeReportJSON writes a minimal runner.Report for compare tests.
+func writeReportJSON(t *testing.T, dir, name string, ttsP95 int64) string {
+	t.Helper()
+	rep := runner.Report{
+		Callers: 1,
+		Seed:    1,
+		Aggregate: metrics.Aggregate{
+			Sessions: 1,
+			TimeToStop: metrics.Summary{
+				Count: 1, Sum: ttsP95, Mean: ttsP95, P50: ttsP95, P95: ttsP95, Max: ttsP95,
+			},
+		},
+	}
+	data, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestCompareIdenticalReportsPass: two copies of the same report exit 0.
+func TestCompareIdenticalReportsPass(t *testing.T) {
+	null := devNull(t)
+	dir := t.TempDir()
+	a := writeReportJSON(t, dir, "a.json", 100)
+	b := writeReportJSON(t, dir, "b.json", 100)
+	if code := run([]string{"compare", a, b}, null, null); code != 0 {
+		t.Fatalf("compare identical exit %d, want 0", code)
+	}
+}
+
+// TestCompareWorseTimeToStopFails: a candidate whose p95 time-to-stop is worse
+// than the baseline report exits 1.
+func TestCompareWorseTimeToStopFails(t *testing.T) {
+	null := devNull(t)
+	dir := t.TempDir()
+	a := writeReportJSON(t, dir, "a.json", 100)
+	b := writeReportJSON(t, dir, "b.json", 200)
+	if code := run([]string{"compare", a, b}, null, null); code != 1 {
+		t.Fatalf("compare worse-tts exit %d, want 1", code)
+	}
+}
+
+// TestCompareTruncatedReportExits2: a truncated report.json is a usage/input
+// error (exit 2), not a regression.
+func TestCompareTruncatedReportExits2(t *testing.T) {
+	null := devNull(t)
+	dir := t.TempDir()
+	a := writeReportJSON(t, dir, "a.json", 100)
+	bad := filepath.Join(dir, "truncated.json")
+	if err := os.WriteFile(bad, []byte(`{"callers":1,"seed":1`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"compare", a, bad}, null, null); code != 2 {
+		t.Fatalf("compare truncated exit %d, want 2", code)
 	}
 }
 

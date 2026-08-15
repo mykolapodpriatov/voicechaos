@@ -11,6 +11,7 @@
 //	voicechaos baseline save scenario.json --out baseline.json
 //	voicechaos check    scenario.json --baseline baseline.json [--budget budget.json]
 //	voicechaos report   report.json
+//	voicechaos compare  a.json b.json [--budget budget.json]
 //	voicechaos validate scenario.json
 //
 // The default build runs the deterministic offline loopback path; passing
@@ -60,6 +61,8 @@ func run(args []string, stdout, stderr *os.File) int {
 		return cmdCheck(ctx, args[1:], stdout, stderr)
 	case "report":
 		return cmdReport(args[1:], stdout, stderr)
+	case "compare":
+		return cmdCompare(args[1:], stdout, stderr)
 	case "validate":
 		return cmdValidate(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
@@ -81,6 +84,7 @@ Usage:
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
   voicechaos report   <report.json>
+  voicechaos compare  <a.json> <b.json> [--budget <budget.json>]
   voicechaos validate <scenario.json>
 
 Flags:
@@ -91,7 +95,7 @@ Flags:
   --header-env extra handshake header from the environment "Name=ENVVAR" (repeatable)
   --out        output file
   --baseline   baseline JSON for check
-  --budget     budget JSON for check (defaults to a built-in budget)
+  --budget     budget JSON for check (built-in default) or compare (no-worsen default)
 `)
 }
 
@@ -334,18 +338,76 @@ func cmdReport(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintln(stderr, "report: missing report path")
 		return 2
 	}
-	data, err := os.ReadFile(args[0])
+	rep, err := loadReport(args[0])
 	if err != nil {
 		fmt.Fprintf(stderr, "report: %v\n", err)
 		return 1
 	}
-	var rep runner.Report
-	if err := json.Unmarshal(data, &rep); err != nil {
-		fmt.Fprintf(stderr, "report: parse: %v\n", err)
-		return 1
-	}
 	printReport(stdout, rep)
 	return 0
+}
+
+// cmdCompare checks candidate report B against baseline report A with the same
+// baseline.Check used by `check`. Missing or malformed reports exit 2. Without
+// --budget, any metric increase vs A fails (zero slack). With --budget, the
+// file is the same shape `check` uses.
+func cmdCompare(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("compare", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	budgetPath := fs.String("budget", "", "budget JSON (defaults to no metric may worsen)")
+	if code, ok := parseArgs(fs, args, stderr); !ok {
+		return code
+	}
+	if fs.NArg() != 2 {
+		fmt.Fprintln(stderr, "compare: usage: compare <a.json> <b.json> [--budget <budget.json>]")
+		return 2
+	}
+	a, err := loadReport(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "compare: %v\n", err)
+		return 2
+	}
+	b, err := loadReport(fs.Arg(1))
+	if err != nil {
+		fmt.Fprintf(stderr, "compare: %v\n", err)
+		return 2
+	}
+	var budget baseline.Budget
+	if *budgetPath != "" {
+		budget, err = config.LoadBudget(*budgetPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "compare: %v\n", err)
+			return 2
+		}
+	}
+	base := baseline.Baseline{Callers: a.Callers, Seed: a.Seed, Aggregate: a.Aggregate}
+	result := baseline.Check(base, b.Aggregate, budget)
+	if result.OK {
+		if *budgetPath == "" {
+			fmt.Fprintln(stdout, "compare: PASS — no metric worsened")
+		} else {
+			fmt.Fprintln(stdout, "compare: PASS — all metrics within budget")
+		}
+		return 0
+	}
+	fmt.Fprintln(stderr, "compare: FAIL — regression:")
+	for _, v := range result.Violations {
+		fmt.Fprintf(stderr, "  - %s\n", v.Message)
+	}
+	return 1
+}
+
+// loadReport reads a runner.Report from path.
+func loadReport(path string) (runner.Report, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return runner.Report{}, err
+	}
+	var rep runner.Report
+	if err := json.Unmarshal(data, &rep); err != nil {
+		return runner.Report{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return rep, nil
 }
 
 // cmdValidate lints a scenario file without executing a run: it loads (which
@@ -387,9 +449,9 @@ func printReport(w *os.File, rep runner.Report) {
 	fmt.Fprintf(w, "  reordered frames : %d\n", a.ReorderedFrames)
 }
 
-// parseArgs parses fs, tolerating a positional argument placed AFTER flags
-// (Go's flag package stops at the first non-flag token, so we reorder the single
-// leading positional to the front). ok=false means the caller should return code.
+// parseArgs parses fs, tolerating positional arguments mixed with flags
+// (Go's flag package stops at the first non-flag token, so we move every
+// positional to the end). ok=false means the caller should return code.
 func parseArgs(fs *flag.FlagSet, args []string, _ *os.File) (int, bool) {
 	if err := fs.Parse(reorderPositional(args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -400,28 +462,31 @@ func parseArgs(fs *flag.FlagSet, args []string, _ *os.File) (int, bool) {
 	return 0, true
 }
 
-// reorderPositional moves the first bare positional token (one not starting with
-// "-" and not consumed as a flag value) to the end, so `cmd <pos> --flag v`
-// parses the same as `cmd --flag v <pos>`. It assumes a single positional, which
-// is true for every subcommand here.
+// reorderPositional moves every bare positional token (one not starting with
+// "-" and not consumed as a flag value) to the end, preserving their order, so
+// `cmd <a> <b> --flag v` and `cmd <a> --flag v <b>` parse the same as
+// `cmd --flag v <a> <b>`. compare takes two report paths; every other
+// subcommand still has one.
 func reorderPositional(args []string) []string {
+	flags := make([]string, 0, len(args))
+	pos := make([]string, 0, 2)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if len(a) > 0 && a[0] == '-' {
+			flags = append(flags, a)
 			// Skip a value following a non-boolean flag of the form "--flag value".
 			if i+1 < len(args) && !isKnownBoolFlag(a) && !hasInlineValue(a) {
 				i++
+				flags = append(flags, args[i])
 			}
 			continue
 		}
-		// a is the positional; move it to the end.
-		out := make([]string, 0, len(args))
-		out = append(out, args[:i]...)
-		out = append(out, args[i+1:]...)
-		out = append(out, a)
-		return out
+		pos = append(pos, a)
 	}
-	return args
+	if len(pos) == 0 {
+		return args
+	}
+	return append(flags, pos...)
 }
 
 // isKnownBoolFlag reports whether a token names one of the boolean flags used by
