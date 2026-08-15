@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,8 +46,14 @@ func devNull(t *testing.T) *os.File {
 
 func writeScenario(t *testing.T) string {
 	t.Helper()
+	return writeScenarioCallers(t, 3)
+}
+
+func writeScenarioCallers(t *testing.T, callers int) string {
+	t.Helper()
+	raw := strings.Replace(scenarioJSON, `"callers": 3`, `"callers": `+strconv.Itoa(callers), 1)
 	p := filepath.Join(t.TempDir(), "scenario.json")
-	if err := os.WriteFile(p, []byte(scenarioJSON), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -206,6 +213,62 @@ func TestNoArgsUsage(t *testing.T) {
 	if code := run(nil, null, null); code != 2 {
 		t.Fatalf("no-args exit %d, want 2", code)
 	}
+}
+
+// TestRunSessionsOverride: --sessions N scales a fixture without editing JSON.
+func TestRunSessionsOverride(t *testing.T) {
+	null := devNull(t)
+	scenario := writeScenarioCallers(t, 4)
+
+	t.Run("sessions 1 reports a single session", func(t *testing.T) {
+		repPath := filepath.Join(t.TempDir(), "report.json")
+		if code := run([]string{"run", scenario, "--sessions", "1", "--out", repPath}, null, null); code != 0 {
+			t.Fatalf("run --sessions 1 exit %d, want 0", code)
+		}
+		raw, err := os.ReadFile(repPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rep runner.Report
+		if err := json.Unmarshal(raw, &rep); err != nil {
+			t.Fatalf("parse report: %v", err)
+		}
+		if rep.Callers != 1 || len(rep.Sessions) != 1 || rep.Aggregate.Sessions != 1 {
+			t.Fatalf("callers=%d sessions=%d aggregate.sessions=%d, want 1/1/1",
+				rep.Callers, len(rep.Sessions), rep.Aggregate.Sessions)
+		}
+	})
+
+	t.Run("sessions 0 is a usage error", func(t *testing.T) {
+		if code := run([]string{"run", scenario, "--sessions", "0"}, null, null); code != 2 {
+			t.Fatalf("run --sessions 0 exit %d, want 2", code)
+		}
+	})
+
+	t.Run("negative sessions is a usage error", func(t *testing.T) {
+		if code := run([]string{"run", scenario, "--sessions", "-1"}, null, null); code != 2 {
+			t.Fatalf("run --sessions -1 exit %d, want 2", code)
+		}
+	})
+
+	t.Run("no flag keeps the fixture value", func(t *testing.T) {
+		repPath := filepath.Join(t.TempDir(), "report.json")
+		if code := run([]string{"run", scenario, "--out", repPath}, null, null); code != 0 {
+			t.Fatalf("run exit %d, want 0", code)
+		}
+		raw, err := os.ReadFile(repPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rep runner.Report
+		if err := json.Unmarshal(raw, &rep); err != nil {
+			t.Fatalf("parse report: %v", err)
+		}
+		if rep.Callers != 4 || len(rep.Sessions) != 4 || rep.Aggregate.Sessions != 4 {
+			t.Fatalf("callers=%d sessions=%d aggregate.sessions=%d, want 4/4/4",
+				rep.Callers, len(rep.Sessions), rep.Aggregate.Sessions)
+		}
+	})
 }
 
 // TestRunMissingScenario returns a non-zero exit.

@@ -6,7 +6,7 @@
 //
 // Subcommands:
 //
-//	voicechaos run      scenario.json [--loopback] [--out report.json]
+//	voicechaos run      scenario.json [--loopback] [--sessions N] [--out report.json]
 //	voicechaos run      scenario.json --endpoint wss://... --codec openai-realtime|gemini-live [--header "Name: value"] [--header-env NAME=ENVVAR]
 //	voicechaos baseline save scenario.json --out baseline.json
 //	voicechaos check    scenario.json --baseline baseline.json [--budget budget.json]
@@ -79,7 +79,7 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `voicechaos — load + chaos test harness for real-time voice agents
 
 Usage:
-  voicechaos run      <scenario.json> [--loopback] [--out report.json]
+  voicechaos run      <scenario.json> [--loopback] [--sessions N] [--out report.json]
   voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--header "Name: value"] [--header-env NAME=ENVVAR] [--out report.json]
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
@@ -89,6 +89,7 @@ Usage:
 
 Flags:
   --loopback   run the deterministic offline pipeline (default)
+  --sessions   override scenario callers for this run (must be > 0)
   --endpoint   a ws:// or wss:// endpoint to run against live, instead of the offline loopback
   --codec      frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)
   --header     extra handshake header "Name: value" (repeatable; same form as curl -H)
@@ -104,6 +105,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	fs.SetOutput(stderr)
 	out := fs.String("out", "", "write the report JSON to this file")
 	_ = fs.Bool("loopback", true, "run the deterministic offline pipeline")
+	sessions := fs.Int("sessions", 0, "override scenario callers for this run (must be > 0)")
 	endpoint := fs.String("endpoint", "", "a ws:// or wss:// endpoint to run against live, instead of the offline loopback")
 	codecName := fs.String("codec", "", "frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)")
 	var headers, headerEnvs stringList
@@ -121,6 +123,23 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "run: %v\n", err)
 		return 1
+	}
+	sessionsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "sessions" {
+			sessionsSet = true
+		}
+	})
+	if sessionsSet {
+		if *sessions <= 0 {
+			fmt.Fprintln(stderr, "run: --sessions must be > 0")
+			return 2
+		}
+		sc.Callers = *sessions
+		if err := sc.Validate(); err != nil {
+			fmt.Fprintf(stderr, "run: %v\n", err)
+			return 2
+		}
 	}
 	rn := &runner.Runner{}
 	if *endpoint != "" {
