@@ -42,6 +42,14 @@ type Report struct {
 	// LeakedGoroutines is the lifecycle counter after wg.Wait; a correct run
 	// leaves it at zero.
 	LeakedGoroutines int64 `json:"leaked_goroutines"`
+
+	// Truncated marks a report whose run was cut short by a wall-clock bound
+	// rather than by the script finishing. The metrics in it are real but
+	// cover less of the scenario than the scenario describes, so they must not
+	// be compared against a baseline recorded from a complete run. A report
+	// that is silently short is worse than no report, which is why this is on
+	// the report itself and not only on the CLI's exit code.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // Merged returns all sessions' events merged into one cross-session log in the

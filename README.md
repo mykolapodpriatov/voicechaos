@@ -81,7 +81,30 @@ This changes the run's semantics in two ways worth knowing:
 
 - **No impairment queue.** `impair.Queue` exists to make the OFFLINE path's simulated chaos reproducible; a live run is already subject to whatever the real network and endpoint do, so nothing is layered on top. `dropped_frames` is therefore always `0` on a live report, and live metrics are not directly comparable to a baseline recorded from an offline `impair.Profile`.
 - **No `FakeAgent`.** The endpoint drives its own turns; `TurnStart`/`TurnEnd` come from the codec decoding the endpoint's own events (e.g. OpenAI Realtime's `response.created`/`response.done`). A scripted barge-in still fires `into_ms` after the caller *observes* that real `TurnStart`, so the same `Script`/`BargeIn` semantics apply — there is just no synthetic turn-start to anchor on.
-- **Timing is real, not virtual.** Script offsets (`at_ms`, `barge_in.into_ms`) are scheduled on elapsed wall-clock time (`clock.RealClock`) from when each session is primed, not on the offline path's virtual `ManualClock`. `max_duration_ms` bounds a live run's real duration; `0` means the run continues until its context is cancelled (Ctrl-C, or an external timeout), so an unbounded live scenario needs an external bound.
+- **Timing is real, not virtual.** Script offsets (`at_ms`, `barge_in.into_ms`) are scheduled on elapsed wall-clock time (`clock.RealClock`) from when each session is primed, not on the offline path's virtual `ManualClock`. `max_duration_ms` bounds a live run's real duration; `0` means the run continues until its context is cancelled.
+
+### Bounding a run with `--timeout`
+
+`--timeout` takes a Go duration (`90s`, `5m`) and bounds the run's real duration:
+
+```sh
+voicechaos run scenario.json --endpoint wss://... --codec openai-realtime --timeout 90s --out report.json
+```
+
+How long a run may take is a property of where it runs, not of what it tests, so this belongs on the command line rather than in the scenario file. The same scenario is then usable from a laptop and from a CI job under different limits, and a scenario written for the offline path, where `max_duration_ms: 0` is harmless because virtual time ends when the script does, does not become an unkillable job the moment someone points it at `--endpoint`.
+
+On a **live** run `--timeout` replaces `max_duration_ms`, which is the same kind of real-time bound, rather than the two being applied together. On the **offline** path `max_duration_ms` bounds *virtual* time and is a different thing entirely, so it stays and `--timeout` is a wall-clock safety net over it. With `--timeout` unset, nothing changes.
+
+Hitting the bound is not a crash. The run stops, the report is still written, and it carries `"truncated": true` so nobody compares a partial run against a complete baseline. `report` prints the same warning.
+
+Exit codes for `run`:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. |
+| 1 | The run failed. |
+| 2 | Bad usage, including an unparseable or negative `--timeout`. |
+| 3 | The run hit `--timeout`. The report was written and is marked truncated. |
 
 ### Scenario (JSON)
 
