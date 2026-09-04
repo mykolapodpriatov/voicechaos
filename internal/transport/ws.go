@@ -308,8 +308,15 @@ func (c *WSConn) Read(ctx context.Context) (Message, error) {
 			return Message{}, fmt.Errorf("ws: set read deadline: %w", err)
 		}
 	}
-	// Clearing only fails on an already-broken conn; see handshake.
-	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	// Clearing only fails on an already-broken conn; see handshake. Skipped
+	// once the conn is closed, so this cannot silently unbound a read that
+	// Close is running concurrently on the same connection.
+	defer func() {
+		if c.isClosed() {
+			return
+		}
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}()
 
 	var (
 		buf      []byte
@@ -442,9 +449,20 @@ func (c *WSConn) readFrame() (frame, error) {
 	return frame{fin: fin, opcode: opcode, payload: payload}, nil
 }
 
+// closeDrainTimeout bounds how long the close handshake waits for the peer's
+// Close echo before giving up and tearing the connection down anyway.
+const closeDrainTimeout = time.Second
+
 // Close performs the client-initiated close handshake: it sends a Close frame,
-// reads (with a short deadline) until the server's Close echo or the deadline,
-// then closes the underlying connection. It is idempotent.
+// waits briefly for the server's Close echo, then closes the underlying
+// connection. It is idempotent.
+//
+// The drain is bounded by a timer this call owns, NOT by the connection's read
+// deadline. A concurrently returning Read clears that deadline on its way out
+// (see Read), and callers close while their read pump is still winding down --
+// engine.RunLive closes every transport before waiting on its pumps -- so a
+// deadline armed here can be wiped between arming it and reading. A peer that
+// never echoes Close would then block this call forever, during shutdown.
 func (c *WSConn) Close() error {
 	var retErr error
 	c.closeOnce.Do(func() {
@@ -453,19 +471,32 @@ func (c *WSConn) Close() error {
 		// Send Close with a normal-closure status code (1000).
 		_ = c.sendCloseFrame(ctx, closePayload(1000))
 		c.markClosed()
-		// Drain until the server's Close echo or the deadline, so the peer sees a
-		// clean handshake; ignore errors (the conn is going away regardless).
-		_ = c.conn.SetReadDeadline(time.Now().Add(time.Second))
-		for {
-			fr, err := c.readFrame()
-			if err != nil {
-				break
+
+		// Drain until the peer's Close echo, so it sees a clean handshake.
+		// Errors are ignored: the conn is going away regardless.
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			for {
+				fr, err := c.readFrame()
+				if err != nil || fr.opcode == opClose {
+					return
+				}
 			}
-			if fr.opcode == opClose {
-				break
-			}
+		}()
+
+		timer := time.NewTimer(closeDrainTimeout)
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
 		}
+
 		retErr = c.conn.Close()
+		// Closing the conn fails any read still in flight, so the drain
+		// goroutine always returns. Join it rather than leaving it detached:
+		// this package is held to an ownership-based leak assertion.
+		<-drained
 	})
 	return retErr
 }
