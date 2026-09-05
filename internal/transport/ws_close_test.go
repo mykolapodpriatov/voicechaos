@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"testing"
@@ -114,4 +115,60 @@ func TestCloseIsIdempotentUnderTheBoundedDrain(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Errorf("the second Close took %s; it should be a no-op", elapsed)
 	}
+}
+
+// Close must not read the connection while a Read owns it: both consume the
+// same bufio.Reader. This drives the two concurrently and relies on -race,
+// which is how the original report surfaced.
+func TestCloseDoesNotReadWhileAReaderOwnsTheConnection(t *testing.T) {
+	// The peer reads (so the Close frame write completes) and answers nothing,
+	// so the reader stays parked inside its frame loop holding the reader.
+	c := silentPeer(t, func(conn net.Conn) net.Conn { return conn })
+
+	reading := make(chan struct{})
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		close(reading)
+		_, _ = c.Read(context.Background())
+	}()
+	<-reading
+	// Give the reader a moment to actually enter the frame loop, so the two are
+	// genuinely overlapping rather than merely started.
+	time.Sleep(50 * time.Millisecond)
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close blocked while a reader owned the connection")
+	}
+
+	select {
+	case <-readDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked Read never returned after Close")
+	}
+}
+
+// Closing while a reader is parked must be prompt: Close hands the drain over
+// rather than waiting out its timer behind a lock it cannot get.
+func TestCloseIsPromptWhileAReaderOwnsTheConnection(t *testing.T) {
+	c := silentPeer(t, func(conn net.Conn) net.Conn { return conn })
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = c.Read(context.Background())
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	_ = c.Close()
+	if elapsed := time.Since(start); elapsed >= closeDrainTimeout {
+		t.Errorf("Close took %s; with a reader parked it should skip the drain, not wait out the %s timer", elapsed, closeDrainTimeout)
+	}
+	<-readDone
 }
