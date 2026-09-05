@@ -25,6 +25,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -82,9 +83,9 @@ Usage:
   voicechaos run      <scenario.json> [--loopback] [--sessions N] [--timeout 90s] [--out report.json]
   voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--header "Name: value"] [--header-env NAME=ENVVAR] [--out report.json]
   voicechaos baseline save <scenario.json> --out <baseline.json>
-  voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
+  voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>] [--format text|json|markdown|github] [--summary <path>]
   voicechaos report   <report.json>
-  voicechaos compare  <a.json> <b.json> [--budget <budget.json>]
+  voicechaos compare  <a.json> <b.json> [--budget <budget.json>] [--format text|json|markdown|github] [--summary <path>]
   voicechaos validate <scenario.json>
 
 Flags:
@@ -105,6 +106,8 @@ Exit codes:
   3  the run hit --timeout; the report was still written and is marked truncated
   --baseline   baseline JSON for check
   --budget     budget JSON for check (built-in default) or compare (no-worsen default)
+  --format     check/compare output: text (default) | json | markdown | github
+  --summary    append the Markdown table to this file, e.g. "$GITHUB_STEP_SUMMARY"
 `)
 }
 
@@ -355,17 +358,63 @@ func cmdBaseline(ctx context.Context, args []string, stdout, stderr *os.File) in
 	return 0
 }
 
+// emitResult renders a CheckResult in the chosen format and writes it, plus
+// the optional Markdown summary file.
+//
+// Only the text format keeps the historical stdout/stderr split, where the PASS
+// line goes to stdout and the failure detail to stderr. A machine-readable
+// payload always goes to stdout whole: half a JSON document on stderr is not
+// something any consumer can use, and the exit code already carries pass/fail.
+func emitResult(res baseline.CheckResult, f baseline.Format, l baseline.Labels,
+	summaryPath string, stdout, stderr *os.File,
+) error {
+	if summaryPath != "" {
+		// Appended, never truncated: $GITHUB_STEP_SUMMARY is shared with every
+		// other step in the job.
+		file, err := os.OpenFile(summaryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("--summary: %w", err)
+		}
+		_, werr := io.WriteString(file, baseline.RenderMarkdown(res, l))
+		cerr := file.Close()
+		if werr != nil {
+			return fmt.Errorf("--summary: %w", werr)
+		}
+		if cerr != nil {
+			return fmt.Errorf("--summary: %w", cerr)
+		}
+	}
+
+	out, err := baseline.Render(res, f, l)
+	if err != nil {
+		return err
+	}
+	if f == baseline.FormatText && !res.OK {
+		fmt.Fprint(stderr, out)
+		return nil
+	}
+	fmt.Fprint(stdout, out)
+	return nil
+}
+
 func cmdCheck(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	basePath := fs.String("baseline", "", "baseline JSON to compare against")
 	budgetPath := fs.String("budget", "", "budget JSON (defaults to a built-in budget)")
+	format := fs.String("format", string(baseline.FormatText), "output: text | json | markdown | github")
+	summary := fs.String("summary", "", "append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
 	if code, ok := parseArgs(fs, args, stderr); !ok {
 		return code
 	}
 	scenarioPath := fs.Arg(0)
 	if scenarioPath == "" || *basePath == "" {
-		fmt.Fprintln(stderr, "check: usage: check <scenario.json> --baseline <baseline.json> [--budget <budget.json>]")
+		fmt.Fprintln(stderr, "check: usage: check <scenario.json> --baseline <baseline.json> [--budget <budget.json>] [--format text|json|markdown|github] [--summary <path>]")
+		return 2
+	}
+	outFormat, ferr := baseline.ParseFormat(*format)
+	if ferr != nil {
+		fmt.Fprintf(stderr, "check: %v\n", ferr)
 		return 2
 	}
 	sc, err := config.LoadScenario(scenarioPath)
@@ -390,13 +439,12 @@ func cmdCheck(ctx context.Context, args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 	result := baseline.Check(base, rep.Aggregate, budget)
-	if result.OK {
-		fmt.Fprintln(stdout, "check: PASS — all metrics within budget")
-		return 0
+	if err := emitResult(result, outFormat, baseline.CheckLabels, *summary, stdout, stderr); err != nil {
+		fmt.Fprintf(stderr, "check: %v\n", err)
+		return 1
 	}
-	fmt.Fprintln(stderr, "check: FAIL — budget exceeded:")
-	for _, v := range result.Violations {
-		fmt.Fprintf(stderr, "  - %s\n", v.Message)
+	if result.OK {
+		return 0
 	}
 	return 1
 }
@@ -423,11 +471,18 @@ func cmdCompare(args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("compare", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	budgetPath := fs.String("budget", "", "budget JSON (defaults to no metric may worsen)")
+	format := fs.String("format", string(baseline.FormatText), "output: text | json | markdown | github")
+	summary := fs.String("summary", "", "append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
 	if code, ok := parseArgs(fs, args, stderr); !ok {
 		return code
 	}
 	if fs.NArg() != 2 {
-		fmt.Fprintln(stderr, "compare: usage: compare <a.json> <b.json> [--budget <budget.json>]")
+		fmt.Fprintln(stderr, "compare: usage: compare <a.json> <b.json> [--budget <budget.json>] [--format text|json|markdown|github] [--summary <path>]")
+		return 2
+	}
+	outFormat, ferr := baseline.ParseFormat(*format)
+	if ferr != nil {
+		fmt.Fprintf(stderr, "compare: %v\n", ferr)
 		return 2
 	}
 	a, err := loadReport(fs.Arg(0))
@@ -450,17 +505,16 @@ func cmdCompare(args []string, stdout, stderr *os.File) int {
 	}
 	base := baseline.Baseline{Callers: a.Callers, Seed: a.Seed, Aggregate: a.Aggregate}
 	result := baseline.Check(base, b.Aggregate, budget)
-	if result.OK {
-		if *budgetPath == "" {
-			fmt.Fprintln(stdout, "compare: PASS — no metric worsened")
-		} else {
-			fmt.Fprintln(stdout, "compare: PASS — all metrics within budget")
-		}
-		return 0
+	labels := baseline.Labels{Command: "compare", PassNote: "no metric worsened", FailNote: "regression"}
+	if *budgetPath != "" {
+		labels.PassNote = "all metrics within budget"
 	}
-	fmt.Fprintln(stderr, "compare: FAIL — regression:")
-	for _, v := range result.Violations {
-		fmt.Fprintf(stderr, "  - %s\n", v.Message)
+	if err := emitResult(result, outFormat, labels, *summary, stdout, stderr); err != nil {
+		fmt.Fprintf(stderr, "compare: %v\n", err)
+		return 1
+	}
+	if result.OK {
+		return 0
 	}
 	return 1
 }
