@@ -76,9 +76,32 @@ type Violation struct {
 	Message  string  `json:"message"`
 }
 
+// MetricCheck is one budget constraint after evaluation, whether or not it
+// held. Every constraint produces one of these, so a passing run is as
+// inspectable as a failing one: "nothing regressed" and "this metric moved 9%
+// against a 10% budget" are very different things to be told.
+type MetricCheck struct {
+	Metric   string  `json:"metric"`
+	Baseline float64 `json:"baseline"`
+	Current  float64 `json:"current"`
+	Limit    float64 `json:"limit"`
+	// Delta is current minus baseline, so a negative value is an improvement.
+	Delta float64 `json:"delta"`
+	OK    bool    `json:"ok"`
+	// Message is set only when the constraint failed; it is the same text
+	// Violation carries.
+	Message string `json:"message,omitempty"`
+}
+
 // CheckResult is the outcome of comparing a fresh aggregate to a baseline.
 type CheckResult struct {
-	OK         bool        `json:"ok"`
+	OK bool `json:"ok"`
+	// Checks holds every constraint, passing or not, in a fixed order. It has
+	// no omitempty: a consumer indexing into it should never have to
+	// special-case an absent key.
+	Checks []MetricCheck `json:"checks"`
+	// Violations is the failing subset, kept so existing consumers and the
+	// terminal output do not have to filter Checks themselves.
 	Violations []Violation `json:"violations,omitempty"`
 }
 
@@ -87,57 +110,68 @@ type CheckResult struct {
 func Check(base Baseline, current metrics.Aggregate, budget Budget) CheckResult {
 	res := CheckResult{OK: true}
 
-	// time-to-stop p95 (percentage budget).
+	// Constraint order is fixed, so two runs render the same rows in the same
+	// places and a diff of two reports is readable.
 	limitTTS := float64(base.Aggregate.TimeToStop.P95) * (1 + budget.MaxTimeToStopRegressionPct/100)
-	if float64(current.TimeToStop.P95) > limitTTS {
-		res.OK = false
-		res.Violations = append(res.Violations, Violation{
-			Metric:   "time_to_stop_p95_ms",
-			Baseline: float64(base.Aggregate.TimeToStop.P95),
-			Current:  float64(current.TimeToStop.P95),
-			Limit:    limitTTS,
-			Message:  fmt.Sprintf("p95 time-to-stop %dms exceeds budget %.1fms (baseline %dms +%.0f%%)", current.TimeToStop.P95, limitTTS, base.Aggregate.TimeToStop.P95, budget.MaxTimeToStopRegressionPct),
-		})
-	}
+	res.add(MetricCheck{
+		Metric:   "time_to_stop_p95_ms",
+		Baseline: float64(base.Aggregate.TimeToStop.P95),
+		Current:  float64(current.TimeToStop.P95),
+		Limit:    limitTTS,
+		Message:  fmt.Sprintf("p95 time-to-stop %dms exceeds budget %.1fms (baseline %dms +%.0f%%)", current.TimeToStop.P95, limitTTS, base.Aggregate.TimeToStop.P95, budget.MaxTimeToStopRegressionPct),
+	})
 
-	// double-talk total (percentage budget).
 	limitDT := float64(base.Aggregate.DoubleTalkMs.Sum) * (1 + budget.MaxDoubleTalkRegressionPct/100)
-	if float64(current.DoubleTalkMs.Sum) > limitDT {
-		res.OK = false
-		res.Violations = append(res.Violations, Violation{
-			Metric:   "double_talk_total_ms",
-			Baseline: float64(base.Aggregate.DoubleTalkMs.Sum),
-			Current:  float64(current.DoubleTalkMs.Sum),
-			Limit:    limitDT,
-			Message:  fmt.Sprintf("total double-talk %dms exceeds budget %.1fms", current.DoubleTalkMs.Sum, limitDT),
-		})
-	}
+	res.add(MetricCheck{
+		Metric:   "double_talk_total_ms",
+		Baseline: float64(base.Aggregate.DoubleTalkMs.Sum),
+		Current:  float64(current.DoubleTalkMs.Sum),
+		Limit:    limitDT,
+		Message:  fmt.Sprintf("total double-talk %dms exceeds budget %.1fms", current.DoubleTalkMs.Sum, limitDT),
+	})
 
-	// stalls (absolute budget).
 	limitStall := base.Aggregate.StallMs + budget.MaxStallRegression
-	if current.StallMs > limitStall {
-		res.OK = false
-		res.Violations = append(res.Violations, Violation{
-			Metric:   "stall_total_ms",
-			Baseline: float64(base.Aggregate.StallMs),
-			Current:  float64(current.StallMs),
-			Limit:    float64(limitStall),
-			Message:  fmt.Sprintf("total stall %dms exceeds budget %dms", current.StallMs, limitStall),
-		})
-	}
+	res.add(MetricCheck{
+		Metric:   "stall_total_ms",
+		Baseline: float64(base.Aggregate.StallMs),
+		Current:  float64(current.StallMs),
+		Limit:    float64(limitStall),
+		Message:  fmt.Sprintf("total stall %dms exceeds budget %dms", current.StallMs, limitStall),
+	})
 
-	// dropped frames (absolute budget).
 	limitDrop := base.Aggregate.DroppedFrames + budget.MaxDroppedRegression
-	if current.DroppedFrames > limitDrop {
-		res.OK = false
-		res.Violations = append(res.Violations, Violation{
-			Metric:   "dropped_frames",
-			Baseline: float64(base.Aggregate.DroppedFrames),
-			Current:  float64(current.DroppedFrames),
-			Limit:    float64(limitDrop),
-			Message:  fmt.Sprintf("dropped frames %d exceeds budget %d", current.DroppedFrames, limitDrop),
-		})
-	}
+	res.add(MetricCheck{
+		Metric:   "dropped_frames",
+		Baseline: float64(base.Aggregate.DroppedFrames),
+		Current:  float64(current.DroppedFrames),
+		Limit:    float64(limitDrop),
+		Message:  fmt.Sprintf("dropped frames %d exceeds budget %d", current.DroppedFrames, limitDrop),
+	})
 
 	return res
+}
+
+// add evaluates one constraint and records it, deriving OK and Delta and
+// appending to Violations when it failed. Every constraint is "current must not
+// exceed limit", so the comparison lives here rather than at four call sites
+// that could drift apart.
+func (r *CheckResult) add(c MetricCheck) {
+	c.OK = c.Current <= c.Limit
+	c.Delta = c.Current - c.Baseline
+	if c.OK {
+		// A message only ever describes a failure; carrying one on a passing
+		// row would show up in the JSON and read as a problem.
+		c.Message = ""
+	}
+	r.Checks = append(r.Checks, c)
+	if !c.OK {
+		r.OK = false
+		r.Violations = append(r.Violations, Violation{
+			Metric:   c.Metric,
+			Baseline: c.Baseline,
+			Current:  c.Current,
+			Limit:    c.Limit,
+			Message:  c.Message,
+		})
+	}
 }

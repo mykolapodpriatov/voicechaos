@@ -58,6 +58,10 @@ voicechaos report report.json
 voicechaos baseline save scenario.json --out baseline.json
 voicechaos check scenario.json --baseline baseline.json   # exit 1 on regression
 
+# In CI: annotate each regression on the run, and put the table on the job page.
+voicechaos check scenario.json --baseline baseline.json \
+  --format github --summary "$GITHUB_STEP_SUMMARY"
+
 # Run the same scenario against a real endpoint instead of the offline loopback
 voicechaos run scenario.json --endpoint wss://api.example.com/realtime --codec openai-realtime --out report.json
 
@@ -72,6 +76,25 @@ voicechaos run scenario.json \
   --header-env "Authorization=OPENAI_AUTH"
 # equivalent: --header "Authorization: Bearer $OPENAI_API_KEY"
 ```
+
+### `check` output formats
+
+`check` is a CI gate, and a gate whose failure lands in the middle of a collapsed log is a gate that gets disabled the first time it goes red on a Friday. `--format` picks the shape:
+
+| Format | For |
+| --- | --- |
+| `text` (default) | The terminal. Unchanged: a PASS line on stdout, or a FAIL line and one bullet per violation on stderr. |
+| `json` | A dashboard or a bot. The full result: **every** metric with its baseline, current value, delta and budget, not only the violations. A passing run is as inspectable as a failing one. |
+| `markdown` | A table, for `$GITHUB_STEP_SUMMARY`. |
+| `github` | [Workflow commands](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions): one `::error` per regression, so each one is annotated on the run. |
+
+`--summary <path>` appends the Markdown table to a file. In a workflow that is `--summary "$GITHUB_STEP_SUMMARY"` and the table lands on the job page with no extra YAML. It appends rather than truncates, because that file is shared with every other step in the job, and it is written whatever `--format` is set to.
+
+Only `text` keeps the stdout/stderr split. A machine-readable payload always goes to stdout whole: half a JSON document on stderr is not something a consumer can use, and the exit code already carries pass/fail.
+
+Exit codes are unchanged: `0` pass, `1` regression, `2` bad usage. An unknown `--format` is a usage error rather than a silent fall back to `text`, so a typo in a CI job cannot quietly turn a parseable report into prose.
+
+`compare` takes the same two flags and reports under its own wording, since without a budget it is asserting that no metric worsened rather than that a budget held.
 
 ### Live runs (`--endpoint`)
 
