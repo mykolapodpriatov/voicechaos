@@ -79,7 +79,7 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `voicechaos — load + chaos test harness for real-time voice agents
 
 Usage:
-  voicechaos run      <scenario.json> [--loopback] [--sessions N] [--out report.json]
+  voicechaos run      <scenario.json> [--loopback] [--sessions N] [--timeout 90s] [--out report.json]
   voicechaos run      <scenario.json> --endpoint <wss://...> --codec <openai-realtime|gemini-live> [--header "Name: value"] [--header-env NAME=ENVVAR] [--out report.json]
   voicechaos baseline save <scenario.json> --out <baseline.json>
   voicechaos check    <scenario.json> --baseline <baseline.json> [--budget <budget.json>]
@@ -94,11 +94,24 @@ Flags:
   --codec      frame codec for a live run: openai-realtime | gemini-live (required with --endpoint)
   --header     extra handshake header "Name: value" (repeatable; same form as curl -H)
   --header-env extra handshake header from the environment "Name=ENVVAR" (repeatable)
+  --timeout    bound the run's real duration (e.g. 90s, 5m); overrides max_duration_ms on a
+               live run; 0 (the default) keeps today's behavior
   --out        output file
+
+Exit codes:
+  0  success
+  1  the run failed
+  2  bad usage
+  3  the run hit --timeout; the report was still written and is marked truncated
   --baseline   baseline JSON for check
   --budget     budget JSON for check (built-in default) or compare (no-worsen default)
 `)
 }
+
+// exitTimeout is the exit code for a run cut short by --timeout. It is
+// distinct from 1 (the run failed) and 2 (bad usage) so a wrapper can tell a
+// bound being hit apart from a genuine failure without parsing stderr.
+const exitTimeout = 3
 
 func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -111,12 +124,17 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 	var headers, headerEnvs stringList
 	fs.Var(&headers, "header", `extra WebSocket handshake header "Name: value" (repeatable)`)
 	fs.Var(&headerEnvs, "header-env", `extra handshake header from the environment "Name=ENVVAR" (repeatable)`)
+	timeout := fs.Duration("timeout", 0, "bound the run's real duration (e.g. 90s, 5m); takes precedence over the scenario's max_duration_ms on a live run; 0 keeps the run unbounded")
 	if code, ok := parseArgs(fs, args, stderr); !ok {
 		return code
 	}
 	scenarioPath := fs.Arg(0)
 	if scenarioPath == "" {
 		fmt.Fprintln(stderr, "run: missing scenario path")
+		return 2
+	}
+	if *timeout < 0 {
+		fmt.Fprintln(stderr, "run: --timeout must not be negative")
 		return 2
 	}
 	sc, err := config.LoadScenario(scenarioPath)
@@ -167,14 +185,45 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr *os.File) int {
 		fmt.Fprintln(stderr, "run: --header/--header-env require --endpoint")
 		return 2
 	}
-	rep, err := rn.Run(ctx, sc)
-	if err != nil && !errors.Is(err, context.Canceled) {
+	// --timeout bounds the whole run in real time. It is the more specific
+	// bound: how long a run may take is a property of where it runs, not of
+	// what it tests, so the same scenario can be used from a laptop and from a
+	// CI job under different limits. On the live path max_duration_ms is the
+	// same kind of real-time bound, so it is dropped rather than silently
+	// applied first and producing whichever of the two is shorter. On the
+	// offline path max_duration_ms bounds VIRTUAL time and is a different
+	// thing entirely, so it stays and --timeout is a wall-clock safety net
+	// over it.
+	runCtx := ctx
+	if *timeout > 0 {
+		if *endpoint != "" {
+			sc.MaxDurationMs = 0
+		}
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+
+	rep, err := rn.Run(runCtx, sc)
+	// A timeout is this process's own deadline firing, not the caller's
+	// cancellation: Ctrl-C cancels the outer ctx and must keep reporting as
+	// cancellation.
+	timedOut := *timeout > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+	rep.Truncated = timedOut
+	if err != nil && !errors.Is(err, context.Canceled) && !timedOut {
 		fmt.Fprintf(stderr, "run: %v\n", err)
 		return 1
 	}
+	// A truncated run still writes its report. Metrics for the part of the
+	// scenario that did execute are more useful than nothing, and the
+	// truncated flag stops anyone comparing them against a complete baseline.
 	if err := emitJSON(*out, stdout, rep); err != nil {
 		fmt.Fprintf(stderr, "run: %v\n", err)
 		return 1
+	}
+	if timedOut {
+		fmt.Fprintf(stderr, "run: timed out after %s; the report is truncated\n", *timeout)
+		return exitTimeout
 	}
 	return 0
 }
@@ -466,6 +515,9 @@ func printReport(w *os.File, rep runner.Report) {
 	fmt.Fprintf(w, "  stalls           : count=%d totalMs=%d\n", a.StallCount, a.StallMs)
 	fmt.Fprintf(w, "  dropped frames   : %d\n", a.DroppedFrames)
 	fmt.Fprintf(w, "  reordered frames : %d\n", a.ReorderedFrames)
+	if rep.Truncated {
+		fmt.Fprintln(w, "  TRUNCATED        : the run hit its --timeout; do not compare against a complete baseline")
+	}
 }
 
 // parseArgs parses fs, tolerating positional arguments mixed with flags
