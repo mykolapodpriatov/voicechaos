@@ -60,6 +60,11 @@ type WSConn struct {
 	maxMsg int
 
 	wmu sync.Mutex // serializes writes (data frames + control frames)
+	// rmu serializes frame READS. Read and Close's drain both consume the same
+	// bufio.Reader, and Close runs while a caller's read pump may still be
+	// winding down (engine.RunLive closes every transport before waiting on its
+	// pumps), so two concurrent readFrame calls are a genuine data race.
+	rmu sync.Mutex
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -296,6 +301,12 @@ func (c *WSConn) Read(ctx context.Context) (Message, error) {
 	// Wire ctx cancellation to a past read deadline so a blocked Read returns.
 	// This runs on ctx's goroutine with no error path to return through; if it
 	// fails the conn is already broken and the blocked read is failing anyway.
+	// Own the reader for the whole frame loop. Close only drains when it can
+	// take this lock, so nothing else touches the bufio.Reader (or the read
+	// deadline) while this call is inside the loop.
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+
 	stop := context.AfterFunc(ctx, func() {
 		_ = c.conn.SetReadDeadline(time.Unix(0, 0))
 	})
@@ -463,6 +474,9 @@ const closeDrainTimeout = time.Second
 // engine.RunLive closes every transport before waiting on its pumps -- so a
 // deadline armed here can be wiped between arming it and reading. A peer that
 // never echoes Close would then block this call forever, during shutdown.
+//
+// The drain is also skipped entirely when a reader currently owns the
+// connection, since the two would otherwise read the same bufio.Reader at once.
 func (c *WSConn) Close() error {
 	var retErr error
 	c.closeOnce.Do(func() {
@@ -472,8 +486,19 @@ func (c *WSConn) Close() error {
 		_ = c.sendCloseFrame(ctx, closePayload(1000))
 		c.markClosed()
 
-		// Drain until the peer's Close echo, so it sees a clean handshake.
-		// Errors are ignored: the conn is going away regardless.
+		// Drain until the peer's Close echo, so it sees a clean handshake, but
+		// only when no reader owns the connection. TryLock rather than Lock: a
+		// pump blocked on a silent peer would otherwise hold Close hostage for
+		// as long as the peer stays quiet, and that pump observes the close
+		// anyway once the conn goes down. Holding rmu also makes the drain
+		// goroutine the ONLY reader, so it cannot race a concurrent Read on the
+		// shared bufio.Reader.
+		if !c.rmu.TryLock() {
+			retErr = c.conn.Close()
+			return
+		}
+		defer c.rmu.Unlock()
+
 		drained := make(chan struct{})
 		go func() {
 			defer close(drained)
