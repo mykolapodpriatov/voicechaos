@@ -199,6 +199,29 @@ func TestBandwidthBacklogThrottles(t *testing.T) {
 	}
 }
 
+// TestZeroPayloadFrameWaitsOnTheBandwidthBacklog: a 0-byte control frame
+// still has to wait for audio that is serializing. TurnEnd is that frame.
+// 8000 bps makes a 1000-byte frame take 1000ms, so a marker sent 20ms later
+// must not be delivered first.
+func TestZeroPayloadFrameWaitsOnTheBandwidthBacklog(t *testing.T) {
+	p := Profile{BandwidthBps: 8000}
+	q := NewQueue(p, 1, 0)
+	audioAt, drop := q.Delay(frame(1, 0, 1000), 0)
+	if drop {
+		t.Fatal("audio frame dropped")
+	}
+	if audioAt != 1000 {
+		t.Fatalf("audio deliverAt %d, want 1000", audioAt)
+	}
+	endAt, drop := q.Delay(frame(2, 20, 0), 20)
+	if drop {
+		t.Fatal("control frame dropped")
+	}
+	if endAt < audioAt {
+		t.Fatalf("control deliverAt %d before audio %d", endAt, audioAt)
+	}
+}
+
 // TestCompositionOrderLossBeforeBandwidth: a dropped frame must NOT advance the
 // bandwidth backlog (loss is applied first, and a dropped frame never
 // serializes). We verify by comparing the backlog with and without a forced

@@ -164,7 +164,9 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 	// delay_ms = PayloadLen*8*1000 / BandwidthBps; the frame can only start
 	// serializing once the previous one finished, so backlog (congestion)
 	// builds rather than being an independent per-frame transform.
-	if p.BandwidthBps > 0 && f.PayloadLen > 0 {
+	// A 0-byte frame (TurnEnd) has delay 0 and still waits. Skipping it
+	// lets the marker overtake audio that has not finished serializing.
+	if p.BandwidthBps > 0 {
 		delayMs := int64(f.PayloadLen) * 8 * 1000 / int64(p.BandwidthBps)
 		start := deliverAt
 		if q.hasLast && q.lastDelivery > start {
