@@ -199,6 +199,26 @@ func TestBandwidthBacklogThrottles(t *testing.T) {
 	}
 }
 
+// TestBandwidthBacklogKeepsSubMillisecondFrames: a frame smaller than one
+// millisecond must still consume link time. 100 bytes at 1_000_000 bps is
+// 0.8 ms, so one thousand of them finish at 800 ms, not at 0.
+func TestBandwidthBacklogKeepsSubMillisecondFrames(t *testing.T) {
+	p := Profile{BandwidthBps: 1_000_000}
+	q := NewQueue(p, 1, 0)
+	const n = 1000
+	var last int64
+	for i := 0; i < n; i++ {
+		at, drop := q.Delay(frame(int64(i), 0, 100), 0)
+		if drop {
+			t.Fatal("frame dropped")
+		}
+		last = at
+	}
+	if last != 800 {
+		t.Fatalf("last deliverAt %d, want 800", last)
+	}
+}
+
 // TestZeroPayloadFrameWaitsOnTheBandwidthBacklog: a 0-byte control frame
 // still has to wait for audio that is serializing. TurnEnd is that frame.
 // 8000 bps makes a 1000-byte frame take 1000ms, so a marker sent 20ms later

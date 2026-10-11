@@ -88,9 +88,13 @@ type Queue struct {
 
 	mu           sync.Mutex
 	lastDelivery int64 // virtual ms of the last serialized delivery (bandwidth backlog)
-	dropped      []audio.Frame
-	hasLast      bool
-	burstBad     bool // Gilbert-Elliott state: false=good, true=bad (loss burst)
+	// bandwidthRemainder is the bit count not yet charged as a whole
+	// millisecond. One small frame divides to 0 ms, so without this a
+	// megabit link never delays a typical audio frame.
+	bandwidthRemainder int64
+	dropped            []audio.Frame
+	hasLast            bool
+	burstBad           bool // Gilbert-Elliott state: false=good, true=bad (loss burst)
 }
 
 // NewQueue builds a per-session impairment queue. The RNG is seeded with
@@ -167,7 +171,10 @@ func (q *Queue) Delay(f audio.Frame, sendNow int64) (deliverAt int64, drop bool)
 	// A 0-byte frame (TurnEnd) has delay 0 and still waits. Skipping it
 	// lets the marker overtake audio that has not finished serializing.
 	if p.BandwidthBps > 0 {
-		delayMs := int64(f.PayloadLen) * 8 * 1000 / int64(p.BandwidthBps)
+		bps := int64(p.BandwidthBps)
+		q.bandwidthRemainder += int64(f.PayloadLen) * 8
+		delayMs := q.bandwidthRemainder * 1000 / bps
+		q.bandwidthRemainder -= delayMs * bps / 1000
 		start := deliverAt
 		if q.hasLast && q.lastDelivery > start {
 			start = q.lastDelivery
